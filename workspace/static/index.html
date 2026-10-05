@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>配额租约服务 · 控制台</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #181f2e; --panel2: #1f2839; --line: #2b3650;
+    --text: #e6ecf7; --muted: #8fa0bd; --accent: #4f8cff; --accent2: #2b6be4;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    background: linear-gradient(180deg, #15203a, #0f1420);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .5px; }
+  header h1 span { color: var(--accent); }
+  .stat { display: flex; flex-direction: column; line-height: 1.25; }
+  .stat b { font-size: 16px; }
+  .stat small { color: var(--muted); font-size: 11px; }
+  .spacer { flex: 1; }
+  .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: rgba(52,211,153,.15); color: var(--ok); border: 1px solid rgba(52,211,153,.4); }
+  .badge.err { background: rgba(248,113,113,.15); color: var(--err); border: 1px solid rgba(248,113,113,.4); }
+  .badge.run { background: rgba(143,160,189,.12); color: var(--muted); border: 1px solid var(--line); }
+
+  main { padding: 18px 22px 60px; max-width: 1280px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  section.card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
+  }
+  section.card h2 {
+    margin: 0 0 12px; font-size: 14px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px; display: flex;
+    align-items: center; gap: 8px;
+  }
+  section.card h2 em {
+    font-style: normal; color: var(--accent); text-transform: none; letter-spacing: 0;
+  }
+
+  form.inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+  label.f { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  input.w-sm, select.w-sm { width: 92px; }
+  input.w-md, select.w-md { width: 150px; }
+  button {
+    cursor: pointer; background: var(--accent2); border-color: var(--accent2);
+    font-weight: 600; padding: 7px 14px;
+  }
+  button:hover { background: var(--accent); }
+  button.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+  button.ghost:hover { color: var(--text); border-color: var(--muted); }
+  button.danger { background: transparent; color: var(--err); border-color: rgba(248,113,113,.4); }
+  button.danger:hover { background: rgba(248,113,113,.12); }
+  button.warn { background: transparent; color: var(--warn); border-color: rgba(251,191,36,.4); }
+  button.warn:hover { background: rgba(251,191,36,.12); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+
+  .tree { font-variant-numeric: tabular-nums; }
+  .node {
+    display: grid; grid-template-columns: 26px 1fr auto; gap: 8px;
+    padding: 8px 10px; border-radius: 8px; align-items: center;
+  }
+  .node:hover { background: var(--panel2); }
+  .node .dot { width: 9px; height: 9px; border-radius: 50%; justify-self: center; }
+  .dot.platform { background: var(--purple); } .dot.organization { background: var(--accent); }
+  .dot.project { background: var(--ok); } .dot.client { background: var(--warn); }
+  .dot.offline { background: var(--err); }
+  .node .meta { color: var(--muted); font-size: 12px; }
+  .node .vals { display: flex; gap: 14px; font-size: 12px; }
+  .node .vals b { font-size: 13px; }
+  .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.off { color: var(--err); border-color: rgba(248,113,113,.4); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.closed td { opacity: .55; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .pill.active { background: rgba(79,140,255,.15); color: var(--accent); }
+  .pill.pending_expired { background: rgba(167,139,250,.18); color: var(--purple); }
+  .pill.released { background: rgba(52,211,153,.15); color: var(--ok); }
+  .pill.revoked { background: rgba(248,113,113,.18); color: var(--err); }
+  .pill.expired { background: rgba(251,191,36,.15); color: var(--warn); }
+  .pill.offline { background: rgba(143,160,189,.2); color: var(--muted); }
+  .pill.draft { background: rgba(79,140,255,.15); color: var(--accent); }
+  .pill.published { background: rgba(52,211,153,.15); color: var(--ok); }
+  .pill.discarded { background: rgba(143,160,189,.2); color: var(--muted); }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
+  .row-actions input { width: 110px; padding: 5px 8px; }
+  .row-actions button { padding: 5px 10px; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .check { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0; border-bottom: 1px dashed var(--line); }
+  .check:last-child { border-bottom: 0; }
+  .check .ic { font-weight: 700; }
+  .check .ic.ok { color: var(--ok); } .check .ic.err { color: var(--err); }
+  .check .nm { font-weight: 600; font-size: 12.5px; }
+  .check .dt { color: var(--muted); font-size: 12px; }
+
+  pre.log {
+    background: #0b0f18; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; max-height: 320px; overflow: auto; font-size: 11.5px;
+    color: #b9c7e2; margin: 0; white-space: pre-wrap; word-break: break-all;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 22px 0; font-size: 13px; }
+
+  #toast {
+    position: fixed; right: 22px; bottom: 22px; display: flex;
+    flex-direction: column; gap: 8px; z-index: 50;
+  }
+  .toast-item {
+    padding: 10px 14px; border-radius: 10px; max-width: 380px; font-size: 13px;
+    background: var(--panel2); border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  .toast-item.ok { border-color: rgba(52,211,153,.5); }
+  .toast-item.err { border-color: rgba(248,113,113,.5); }
+  .bar { height: 6px; background: var(--panel2); border-radius: 999px; overflow: hidden; min-width: 120px; }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); }
+
+  .plan-item {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 10px; background: var(--panel2);
+  }
+  .plan-item.published { border-color: rgba(52,211,153,.35); }
+  .plan-item.discarded { opacity: .6; }
+  .plan-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .plan-head .pid { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .plan-head .seq { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .plan-changes { margin: 8px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+  .chg {
+    font-size: 12px; padding: 3px 9px; border-radius: 6px;
+    background: var(--panel); border: 1px solid var(--line); font-variant-numeric: tabular-nums;
+  }
+  .chg.bad { border-color: rgba(248,113,113,.5); color: var(--err); }
+  .chg .d-up { color: var(--ok); } .chg .d-down { color: var(--warn); }
+  .plan-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .plan-actions button { padding: 5px 12px; font-size: 12px; }
+  .preview-box { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .banner {
+    padding: 7px 12px; border-radius: 8px; font-size: 12.5px; margin: 8px 0;
+    background: rgba(251,191,36,.12); border: 1px solid rgba(251,191,36,.45); color: var(--warn);
+  }
+  .banner.ok { background: rgba(52,211,153,.1); border-color: rgba(52,211,153,.4); color: var(--ok); }
+  .banner.err { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.45); color: var(--err); }
+  .sub-h { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; margin: 8px 0 4px; }
+  .mini-table { width: 100%; font-size: 12px; }
+  .mini-table th, .mini-table td { padding: 4px 6px; }
+  .plan-editor select, .plan-editor input { margin-right: 6px; }
+  .editor-row { display: flex; gap: 6px; align-items: flex-end; margin-bottom: 6px; flex-wrap: wrap; }
+  .editor-row label.f { font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>配额租约服务 <span>· Lease Console</span></h1>
+  <div class="stat"><b id="h-cap">–</b><small>全局容量</small></div>
+  <div class="stat"><b id="h-avail" style="color:var(--ok)">–</b><small>Σ 可用</small></div>
+  <div class="stat"><b id="h-consumed" style="color:var(--warn)">–</b><small>已消费（不可回收）</small></div>
+  <div class="stat"><b id="h-leases">–</b><small>活动 / 挂起到期租约</small></div>
+  <div class="spacer"></div>
+  <span id="h-audit" class="badge run">审计未运行</span>
+  <button class="ghost" id="btn-audit">立即审计</button>
+  <label class="f" style="flex-direction:row;align-items:center;gap:6px;color:var(--muted)">
+    <input type="checkbox" id="auto" checked style="width:auto" /> 自动刷新
+  </label>
+</header>
+
+<main>
+  <!-- 初始化 / 容量 -->
+  <section class="card" id="sec-bootstrap" hidden>
+    <h2>① 初始化平台</h2>
+    <form class="inline" id="f-bootstrap">
+      <label class="f">全局容量
+        <input class="w-md" name="capacity" type="number" min="0" value="1000" required />
+      </label>
+      <button>设置全局容量</button>
+      <span class="muted">只允许执行一次；之后用“调整容量”缩/扩容。</span>
+    </form>
+  </section>
+
+  <div class="grid">
+    <!-- 节点树 -->
+    <section class="card">
+      <h2>② 层级账户 <em id="tree-cap-line"></em></h2>
+      <div id="tree" class="tree"></div>
+      <h2 style="margin-top:16px">注册节点</h2>
+      <form class="inline" id="f-node">
+        <label class="f">类型
+          <select class="w-md" name="type">
+            <option value="organization">组织 organization</option>
+            <option value="project">项目 project</option>
+            <option value="client">客户端 client</option>
+          </select>
+        </label>
+        <label class="f">父节点
+          <select class="w-md" name="parent_id" id="node-parent"></select>
+        </label>
+        <label class="f">自定义 ID（可选）<input class="w-md" name="node_id" placeholder="自动生成" /></label>
+        <button>注册</button>
+      </form>
+    </section>
+
+    <!-- 租约操作 -->
+    <section class="card">
+      <h2>③ 申请租约</h2>
+      <form class="inline" id="f-grant">
+        <label class="f">父级（出租）<select class="w-md" name="lessor_id" id="g-lessor"></select></label>
+        <label class="f">子级（承租）<select class="w-md" name="holder_id" id="g-holder"></select></label>
+        <label class="f">额度<input class="w-sm" name="amount" type="number" min="1" value="100" required /></label>
+        <label class="f">有效期(秒，空=永久)<input class="w-sm" name="ttl_seconds" type="number" min="1" placeholder="∞" /></label>
+        <button>授予</button>
+      </form>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">
+        授予在服务端串行校验「父级当前可用额度」；跨层并发申请由账本锁保证不超卖。
+      </p>
+      <h2 style="margin-top:16px">全局容量</h2>
+      <form class="inline" id="f-capacity">
+        <label class="f">新容量<input class="w-md" name="capacity" type="number" min="0" required id="cap-input" /></label>
+        <button class="warn">调整容量</button>
+        <span class="muted">低于活动组织租约占用时将被拒绝。</span>
+      </form>
+    </section>
+  </div>
+
+  <!-- 租约表 -->
+  <section class="card">
+    <h2>④ 租约与用量 <em>消费按 usage_event_id 幂等；归还/撤销/到期/离线只退未消费余量</em></h2>
+    <div style="overflow-x:auto">
+      <table id="lease-table">
+        <thead>
+          <tr>
+            <th>租约</th><th>父级 → 子级</th>
+            <th class="num">授予</th><th class="num">已消费</th><th class="num">剩余</th>
+            <th class="num">剩余时间</th><th class="num">修订号</th><th>状态</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 批量容量调整草案 -->
+  <section class="card" id="sec-plans">
+    <h2>⑤ 批量容量调整草案 <em>编辑多条节点容量变更 → 预览逐层余额/受影响租约 → 原子发布；创建后账本有新授约/消费/续约/结算则必须重新预览</em></h2>
+    <div class="plan-editor">
+      <div id="plan-rows"></div>
+      <form class="inline" id="f-plan" style="margin-top:8px">
+        <button type="button" class="ghost" id="btn-add-chg">+ 增加一条变更</button>
+        <button>创建草案</button>
+        <span class="muted" style="font-size:12px">容量沿父子边移动：扩容向父级支取、缩容把余量退回父级；同一节点在草案中只能出现一次。</span>
+      </form>
+    </div>
+    <h2 style="margin-top:18px">草案列表 <em id="plan-count" style="font-style:normal"></em></h2>
+    <div id="plan-list"><p class="muted">还没有草案。</p></div>
+  </section>
+
+  <div class="grid">
+    <!-- 审计 -->
+    <section class="card">
+      <h2>⑥ 一致性审计 <em id="audit-time"></em></h2>
+      <div id="audit"><p class="muted">点击“立即审计”或等待自动刷新。</p></div>
+    </section>
+    <!-- 事件账本 -->
+    <section class="card">
+      <h2>⑦ 事件账本（append-only · SHA-256 哈希链）</h2>
+      <pre class="log" id="event-log">加载中…</pre>
+    </section>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const TYPE_NAME = { platform: "平台", organization: "组织", project: "项目", client: "客户端" };
+
+function toast(msg, ok = true) {
+  const el = document.createElement("div");
+  el.className = "toast-item " + (ok ? "ok" : "err");
+  el.textContent = msg;
+  $("#toast").appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+
+async function api(path, body) {
+  const opt = body === undefined
+    ? { method: "GET" }
+    : { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) };
+  const res = await fetch(path, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error((data && data.message) || (res.status + " " + res.statusText));
+    err.details = data && data.details;
+    throw err;
+  }
+  return data;
+}
+
+const uid = (p) => p + "-" + Math.random().toString(16).slice(2, 10);
+const esc = (v) => (v === null || v === undefined) ? "" : String(v);
+function fmtTime(ts) {
+  if (!ts) return "∞";
+  const d = new Date(ts * 1000), p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// ---- 渲染：头部 ----
+function renderHeader(s) {
+  $("#h-cap").textContent = s.bootstrapped ? s.global_capacity : "未初始化";
+  $("#h-avail").textContent = s.total_available;
+  $("#h-consumed").textContent = s.total_consumed;
+  $("#h-leases").textContent = s.active_lease_count + " / " + (s.pending_lease_count || 0);
+  $("#sec-bootstrap").hidden = s.bootstrapped;
+  $("#cap-input").value = s.global_capacity;
+  $("#tree-cap-line").textContent = s.bootstrapped
+    ? `平台可用 ${s.nodes[0] ? s.nodes[0].available : 0} / ${s.global_capacity}` : "";
+}
+
+// ---- 渲染：节点树 ----
+function renderTree(s) {
+  const tree = $("#tree");
+  tree.innerHTML = "";
+  if (!s.bootstrapped) { tree.innerHTML = '<p class="muted">请先初始化平台。</p>'; return []; }
+
+  s.nodes.forEach((n, depth) => {
+    const row = document.createElement("div");
+    row.className = "node";
+    row.style.paddingLeft = (10 + depth * 22) + "px";
+
+    const dot = document.createElement("span");
+    dot.className = "dot " + n.type + ((n.type === "client" && !n.online) ? " offline" : "");
+    row.appendChild(dot);
+
+    const main = document.createElement("div");
+    const t1 = document.createElement("div");
+    const name = document.createElement("b");
+    name.textContent = n.id;
+    t1.appendChild(name);
+    const tag = document.createElement("span");
+    tag.className = "tag" + (n.type === "client" && !n.online ? " off" : "");
+    tag.textContent = " " + TYPE_NAME[n.type] + (n.type === "client" ? (n.online ? " · 在线" : " · 离线") : "");
+    t1.appendChild(tag);
+    main.appendChild(t1);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `容量 ${n.id === "platform" ? s.global_capacity : (n.capacity || 0)} · 入边余量 ${n.incoming_remaining} · 已授出 ${n.outgoing_granted} · 累计消费 ${n.consumed}`;
+    main.appendChild(meta);
+    row.appendChild(main);
+
+    const vals = document.createElement("div");
+    vals.className = "vals";
+    const v = document.createElement("div");
+    v.innerHTML = `可用 <b style="color:${n.available < 0 ? "var(--err)" : "var(--ok)"}">${n.available}</b>`;
+    vals.appendChild(v);
+    if (n.type === "client") {
+      const b = document.createElement("button");
+      b.className = n.online ? "danger" : "";
+      b.textContent = n.online ? "置为离线" : "置为在线";
+      b.onclick = async () => {
+        try { await api("/api/clients/presence", { client_id: n.id, online: !n.online });
+          toast(`${n.id} 已${n.online ? "离线（其活动租约将被关闭并退回余量）" : "上线"}`); refreshAll(); }
+        catch (e) { toast(e.message, false); }
+      };
+      vals.appendChild(b);
+    }
+    row.appendChild(vals);
+    tree.appendChild(row);
+  });
+  return s.nodes;
+}
+
+function fillSelect(sel, nodes, predicate, labeler) {
+  const cur = sel.value;
+  sel.innerHTML = "";
+  nodes.filter(predicate).forEach((n) => {
+    const o = document.createElement("option");
+    o.value = n.id;
+    o.textContent = labeler(n);
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+}
+
+function renderForms(s) {
+  if (!s.bootstrapped) return;
+  const clients = s.nodes.filter((n) => n.type === "client");
+  // 注册节点时，父节点候选随类型变化
+  const typeSel = document.forms["f-node"].elements.type;
+  const parentSel = $("#node-parent");
+  const syncParent = () => {
+    const want = { organization: "platform", project: "organization", client: "project" }[typeSel.value];
+    fillSelect(parentSel, s.nodes, (n) => n.type === want,
+      (n) => n.id + " (可用 " + n.available + ")");
+  };
+  typeSel.onchange = syncParent; syncParent();
+
+  // 租约：合法父子对
+  const pairs = [];
+  s.nodes.forEach((n) => {
+    if (n.id === "platform") return;
+    const parent = s.nodes.find((x) => x.id === n.parent_id);
+    if (parent) pairs.push({ parent, child: n });
+  });
+  fillSelect($("#g-lessor"), s.nodes, () => true,
+    (n) => n.id + " (" + TYPE_NAME[n.type] + ", 可用 " + n.available + ")");
+  const syncHolder = () => {
+    const lessor = s.nodes.find((n) => n.id === $("#g-lessor").value);
+    fillSelect($("#g-holder"), pairs.filter((pp) => pp.parent.id === lessor?.id).map((pp) => pp.child),
+      () => true, (n) => n.id + (n.type === "client" ? (n.online ? " · 在线" : " · 离线") : ""));
+  };
+  $("#g-lessor").onchange = syncHolder; syncHolder();
+}
+
+// ---- 渲染：租约表 ----
+function renderLeases(s) {
+  const tb = $("#lease-table tbody");
+  tb.innerHTML = "";
+  if (!s.leases.length) {
+    tb.innerHTML = '<tr><td colspan="9" class="empty">还没有租约。在上方为合法父子对授予一条。</td></tr>';
+    return;
+  }
+  s.leases.slice().reverse().forEach((l) => {
+    const tr = document.createElement("tr");
+    if (l.status === "closed") tr.className = "closed";
+    const td = (txt, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = txt; return c; };
+    tr.appendChild(td(l.id.slice(0, 14)));
+    tr.appendChild(td(`${l.lessor_id} → ${l.holder_id}`));
+    tr.appendChild(td(l.amount, "num"));
+    tr.appendChild(td(l.consumed, "num"));
+    tr.appendChild(td(l.remaining, "num"));
+    tr.appendChild(td(l.status === "active"
+      ? (l.seconds_remaining === null ? "∞" : l.seconds_remaining + "s")
+      : (l.closed_at ? fmtTime(l.closed_at) : "–"), "num"));
+    tr.appendChild(td(l.revision ?? 0, "num"));
+    const st = document.createElement("td");
+    const pill = document.createElement("span");
+    const pillCls = l.status === "closed" ? l.reason : l.status;
+    pill.className = "pill " + pillCls;
+    const STATUS_TEXT = {
+      active: "活动",
+      pending_expired: "到期挂起",
+      released: "已归还",
+      revoked: "已撤销",
+      expired: "已到期结算",
+      offline: "离线关闭",
+    };
+    pill.textContent = STATUS_TEXT[pillCls] || l.status || l.reason;
+    st.appendChild(pill); tr.appendChild(st);
+
+    const acts = document.createElement("td");
+    const wrap = document.createElement("div");
+    wrap.className = "row-actions";
+    if (l.status === "active") {
+      const amt = document.createElement("input");
+      amt.type = "number"; amt.min = "1"; amt.placeholder = "用量";
+      wrap.appendChild(amt);
+      const useBtn = document.createElement("button");
+      useBtn.textContent = "扣减";
+      useBtn.onclick = async () => {
+        const amount = parseInt(amt.value, 10);
+        if (!amount || amount < 1) return toast("请输入用量", false);
+        try {
+          const r = await api("/api/leases/usage",
+            { lease_id: l.id, amount, usage_event_id: uid("evt"), expected_revision: l.revision });
+          toast(`扣减 ${amount} 成功（回执 ${r.usage_event_id}）`); refreshAll();
+        } catch (e) { toast(e.message, false); }
+      };
+      wrap.appendChild(useBtn);
+
+      // 有效期修订：提交当前修订号 + 延后秒数；失败提示带上最新修订号
+      if (l.expires_at !== null) {
+        const ext = document.createElement("input");
+        ext.type = "number"; ext.min = "1"; ext.placeholder = "延后秒数";
+        wrap.appendChild(ext);
+        const amend = document.createElement("button");
+        amend.className = "warn"; amend.textContent = "续约";
+        amend.onclick = async () => {
+          const extend = parseInt(ext.value, 10);
+          if (!extend || extend < 1) return toast("请输入要延后的秒数", false);
+          try {
+            const r = await api("/api/leases/amend", {
+              lease_id: l.id, expected_revision: l.revision, extend_seconds: extend,
+              command_id: uid("amend"),
+            });
+            toast(`续约成功：修订号 ${l.revision} → ${r.revision}，截止时间延后 ${extend}s`);
+            refreshAll();
+          } catch (e) {
+            const d = e.details;
+            if (d && d.current_revision !== undefined)
+              toast(`${e.message}（最新修订号 ${d.current_revision}，状态 ${d.status}）`, false);
+            else toast(e.message, false);
+          }
+        };
+        wrap.appendChild(amend);
+      }
+
+      const rel = document.createElement("button");
+      rel.className = "ghost"; rel.textContent = "归还";
+      rel.onclick = async () => {
+        try { const r = await api("/api/leases/release",
+          { lease_id: l.id, expected_revision: l.revision });
+          toast(`归还成功，释放未消费 ${r.released_amount}，已消费 ${r.consumed_amount} 保留`); refreshAll(); }
+        catch (e) { toast(e.message, false); }
+      };
+      wrap.appendChild(rel);
+      const rev = document.createElement("button");
+      rev.className = "danger"; rev.textContent = "撤销";
+      rev.onclick = async () => {
+        try { const r = await api("/api/leases/revoke",
+          { lease_id: l.id, expected_revision: l.revision });
+          toast(`撤销成功，释放未消费 ${r.released_amount}`); refreshAll(); }
+        catch (e) { toast(e.message, false); }
+      };
+      wrap.appendChild(rev);
+    } else if (l.status === "pending_expired") {
+      wrap.appendChild(document.createTextNode("已到期，待下游释放后结算（退 " + l.remaining + "）"));
+    } else {
+      wrap.appendChild(document.createTextNode("已消费 " + l.consumed + " 永久保留"));
+    }
+    acts.appendChild(wrap); tr.appendChild(acts);
+    tb.appendChild(tr);
+  });
+}
+
+// ---- 审计 ----
+async function runAudit(silent) {
+  try {
+    const a = await api("/api/audit");
+    const badge = $("#h-audit");
+    badge.className = "badge " + (a.ok ? "ok" : "err");
+    badge.textContent = a.ok ? "审计通过 ✓" : "审计异常 ✗";
+    $("#audit-time").textContent = new Date().toLocaleTimeString();
+    const box = $("#audit");
+    box.innerHTML = "";
+    a.checks.forEach((c) => {
+      const d = document.createElement("div");
+      d.className = "check";
+      d.innerHTML = `<span class="ic ${c.ok ? "ok" : "err"}">${c.ok ? "✓" : "✗"}</span>
+        <div><div class="nm"></div><div class="dt"></div></div>`;
+      d.querySelector(".nm").textContent = c.name;
+      d.querySelector(".dt").textContent = c.detail;
+      box.appendChild(d);
+    });
+    const sum = document.createElement("div");
+    sum.className = "muted";
+    sum.style.fontSize = "12px";
+    sum.style.marginTop = "8px";
+    sum.textContent = `事件 ${a.event_count} 条 · 命令 ${a.command_count} 条 · Σ可用 ${a.total_available} + 消费 ${a.total_consumed} = ${a.global_capacity}`;
+    box.appendChild(sum);
+    if (!silent && a.ok) toast("一致性审计全部通过");
+    if (!a.ok) toast("一致性审计发现异常，请查看面板", false);
+  } catch (e) { if (!silent) toast("审计失败: " + e.message, false); }
+}
+
+// ---- 事件账本 ----
+async function loadEvents() {
+  try {
+    const r = await api("/api/events");
+    $("#event-log").textContent = r.events.slice().reverse()
+      .map((e) => `#${String(e.seq).padStart(4, "0")}  ${e.event_type.padEnd(22)} ${e.command_id}\n        ${JSON.stringify(e.payload, null, 0)}`)
+      .join("\n");
+  } catch { /* 忽略定时刷新错误 */ }
+}
+
+// ---- 批量容量调整草案 ----
+function addPlanRow(nodeId) {
+  const wrap = $("#plan-rows");
+  const row = document.createElement("div");
+  row.className = "editor-row";
+  const sel = document.createElement("select");
+  (lastState ? lastState.nodes : []).forEach((n) => {
+    const o = document.createElement("option");
+    o.value = n.id;
+    o.textContent = n.id + " (" + TYPE_NAME[n.type] + ", 当前容量 "
+      + (n.id === "platform" ? lastState.global_capacity : (n.capacity || 0))
+      + ", 可用 " + n.available + ")";
+    sel.appendChild(o);
+  });
+  if (nodeId) sel.value = nodeId;
+  const cap = document.createElement("input");
+  cap.type = "number"; cap.min = "0"; cap.placeholder = "新容量"; cap.style.width = "120px";
+  const del = document.createElement("button");
+  del.type = "button"; del.className = "ghost"; del.textContent = "移除";
+  del.onclick = () => row.remove();
+  row.append(sel, cap, del);
+  wrap.appendChild(row);
+}
+
+function renderPreviewBox(container, pv) {
+  const box = document.createElement("div");
+  box.className = "preview-box";
+
+  const banner = document.createElement("div");
+  banner.className = "banner " + (pv.valid ? "ok" : "err");
+  banner.textContent = pv.valid
+    ? `预览通过：整批 ${pv.items.length} 项变更合法，发布后将原子写入 ${pv.items.length} 条容量事件`
+    : `预览未通过：${pv.items.filter((i) => !i.valid).length} 项不合法，发布将整批拒绝（不会有任何变更生效）`;
+  box.appendChild(banner);
+
+  if (pv.drifted_from_base) {
+    const stale = document.createElement("div");
+    stale.className = "banner";
+    const labels = (pv.intervening_changes || [])
+      .map((c) => `${c.label}×${c.count}`).join("、");
+    stale.textContent = `草案已陈旧：创建后账本发生了 ${labels || "业务变更"}（水位 ${pv.base_seq} → ${pv.current_seq}）；本次预览已基于最新账本，可直接发布。`;
+    box.appendChild(stale);
+  }
+
+  // 逐项结果
+  const h1 = document.createElement("div");
+  h1.className = "sub-h"; h1.textContent = "逐项校验";
+  box.appendChild(h1);
+  const t1 = document.createElement("table");
+  t1.className = "mini-table";
+  t1.innerHTML = "<thead><tr><th>#</th><th>节点</th><th class='num'>旧容量</th><th class='num'>新容量</th><th class='num'>Δ</th><th>结果/拒绝原因</th></tr></thead>";
+  const tb1 = document.createElement("tbody");
+  pv.items.forEach((it) => {
+    const tr = document.createElement("tr");
+    const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = v; return c; };
+    tr.appendChild(td(it.index + 1));
+    tr.appendChild(td(it.node_id));
+    tr.appendChild(td(it.old_capacity, "num"));
+    tr.appendChild(td(it.new_capacity, "num"));
+    const d = document.createElement("td");
+    d.className = "num";
+    d.innerHTML = it.delta === 0 ? "0"
+      : (it.delta > 0 ? `<span class="d-up">+${it.delta}</span>` : `<span class="d-down">${it.delta}</span>`);
+    tr.appendChild(d);
+    const res = document.createElement("td");
+    res.textContent = it.valid ? "✓ 合法" : "✗ " + it.reason;
+    res.style.color = it.valid ? "var(--ok)" : "var(--err)";
+    tr.appendChild(res);
+    tb1.appendChild(tr);
+  });
+  t1.appendChild(tb1);
+  box.appendChild(t1);
+
+  // 逐层余额
+  const h2 = document.createElement("div");
+  h2.className = "sub-h";
+  h2.textContent = `执行后的逐层余额（全局容量 ${pv.global_capacity_before} → ${pv.global_capacity_after}）`;
+  box.appendChild(h2);
+  const t2 = document.createElement("table");
+  t2.className = "mini-table";
+  t2.innerHTML = "<thead><tr><th>层级节点</th><th class='num'>容量 前→后</th><th class='num'>余额 前→后</th></tr></thead>";
+  const tb2 = document.createElement("tbody");
+  pv.layer_balances.forEach((lb) => {
+    const tr = document.createElement("tr");
+    if (!lb.touched) tr.style.opacity = ".55";
+    const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.innerHTML = v; return c; };
+    tr.appendChild(td(`${TYPE_NAME[lb.node_type] || lb.node_type} · ${lb.node_id}` + (lb.touched ? "" : "（不变，仅展示层级链）")));
+    tr.appendChild(td(`${lb.capacity_before} → <b>${lb.capacity_after}</b>`, "num"));
+    const changed = lb.before !== lb.after;
+    tr.appendChild(td(`${lb.before} → <b style="color:${changed ? "var(--accent)" : "inherit"}">${lb.after}</b>`, "num"));
+    tb2.appendChild(tr);
+  });
+  t2.appendChild(tb2);
+  box.appendChild(t2);
+
+  // 受影响租约
+  const h3 = document.createElement("div");
+  h3.className = "sub-h";
+  h3.textContent = `受影响租约（${pv.affected_leases.length} 条未结算边）`;
+  box.appendChild(h3);
+  if (!pv.affected_leases.length) {
+    box.appendChild(document.createTextNode("无"));
+  } else {
+    const t3 = document.createElement("table");
+    t3.className = "mini-table";
+    t3.innerHTML = "<thead><tr><th>租约</th><th>父 → 子</th><th>角色</th><th class='num'>授予/消费/剩余</th><th>状态</th></tr></thead>";
+    const tb3 = document.createElement("tbody");
+    pv.affected_leases.forEach((a) => {
+      const tr = document.createElement("tr");
+      const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = v; return c; };
+      tr.appendChild(td(a.lease_id));
+      tr.appendChild(td(`${a.lessor_id} → ${a.holder_id}`));
+      tr.appendChild(td(a.affected_role));
+      tr.appendChild(td(`${a.amount} / ${a.consumed} / ${a.remaining}`, "num"));
+      tr.appendChild(td(a.status === "active" ? "活动" : "到期挂起"));
+      tb3.appendChild(tr);
+    });
+    t3.appendChild(tb3);
+    box.appendChild(t3);
+  }
+  container.appendChild(box);
+}
+
+async function renderPlans() {
+  const box = $("#plan-list");
+  box.innerHTML = "";
+  let data = { plans: [] };
+  try { data = await api("/api/capacity-plans"); } catch { return; }
+  $("#plan-count").textContent = data.count ? `共 ${data.count} 份` : "";
+  if (!data.plans.length) {
+    box.innerHTML = '<p class="muted">还没有草案。</p>';
+    return;
+  }
+  data.plans.slice().reverse().forEach((pl) => {
+    const card = document.createElement("div");
+    card.className = "plan-item " + pl.status;
+
+    const head = document.createElement("div");
+    head.className = "plan-head";
+    const id = document.createElement("span");
+    id.className = "pid"; id.textContent = pl.plan_id;
+    head.appendChild(id);
+    const pill = document.createElement("span");
+    pill.className = "pill " + pl.status;
+    pill.textContent = { draft: "草案", published: "已发布", discarded: "已废弃" }[pl.status];
+    head.appendChild(pill);
+    const seq = document.createElement("span");
+    seq.className = "seq";
+    seq.textContent = `创建水位 #${pl.base_seq}` + (pl.last_preview_seq !== null
+      ? ` · 最后预览水位 #${pl.last_preview_seq}` : " · 未预览");
+    head.appendChild(seq);
+    card.appendChild(head);
+
+    const changes = document.createElement("div");
+    changes.className = "plan-changes";
+    pl.changes.forEach((ch) => {
+      const tag = document.createElement("span");
+      tag.className = "chg";
+      tag.innerHTML = `${ch.node_id} → 容量 ${ch.capacity}`;
+      changes.appendChild(tag);
+    });
+    card.appendChild(changes);
+
+    const storedPv = pl.status === "published"
+      ? (pl.publish_result || null)
+      : (pl.last_preview || null);
+    if (storedPv) renderPreviewBox(card, storedPv);
+
+    if (pl.status === "published" && pl.publish_result) {
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.style.fontSize = "12px";
+      note.style.marginTop = "6px";
+      note.textContent = `已于水位 #${pl.last_preview_seq} 原子发布 ${pl.publish_result.applied_count} 项变更；重复发布只会返回此首次结果。`;
+      card.appendChild(note);
+    }
+
+    if (pl.status === "draft") {
+      const acts = document.createElement("div");
+      acts.className = "plan-actions";
+      const pvBtn = document.createElement("button");
+      pvBtn.className = "warn"; pvBtn.textContent = "预览";
+      pvBtn.onclick = async () => {
+        try { const pv = await api("/api/capacity-plans/preview", { plan_id: pl.plan_id });
+          toast(pv.valid ? "预览通过，可以发布" : "预览发现不合法项，发布将被整批拒绝", pv.valid);
+          renderPlans();
+        } catch (e) { toast(e.message, false); }
+      };
+      acts.appendChild(pvBtn);
+      const pubBtn = document.createElement("button");
+      pubBtn.textContent = "发布";
+      pubBtn.onclick = async () => {
+        try {
+          const r = await api("/api/capacity-plans/publish", { plan_id: pl.plan_id });
+          if (r.replayed) toast("该草案已发布，返回首次发布结果", false);
+          else toast(`已原子发布 ${r.applied_count} 项容量变更`);
+          renderPlans(); refreshState(); loadEvents(); runAudit(true);
+        } catch (e) {
+          if (e.details && e.details.intervening_changes)
+            toast(e.message + "（已陈旧，请先重新预览）", false);
+          else toast(e.message, false);
+        }
+      };
+      acts.appendChild(pubBtn);
+      const disBtn = document.createElement("button");
+      disBtn.className = "danger"; disBtn.textContent = "废弃";
+      disBtn.onclick = async () => {
+        try { await api("/api/capacity-plans/discard", { plan_id: pl.plan_id });
+          toast("草案已废弃"); renderPlans();
+        } catch (e) { toast(e.message, false); }
+      };
+      acts.appendChild(disBtn);
+      card.appendChild(acts);
+    }
+    box.appendChild(card);
+  });
+}
+
+function bindPlanForm() {
+  addPlanRow(); addPlanRow();
+  $("#btn-add-chg").onclick = () => addPlanRow();
+  $("#f-plan").onsubmit = async (e) => {
+    e.preventDefault();
+    const changes = [];
+    [...$("#plan-rows").children].forEach((row) => {
+      const node_id = row.querySelector("select").value;
+      const raw = row.querySelector("input").value;
+      if (raw.trim() === "") return;
+      changes.push({ node_id, capacity: parseInt(raw, 10) });
+    });
+    if (!changes.length) return toast("请至少填写一条节点容量变更", false);
+    try {
+      const r = await api("/api/capacity-plans",
+        { changes, command_id: uid("plan-create") });
+      $("#plan-rows").innerHTML = "";
+      addPlanRow(); addPlanRow();
+      toast(`草案 ${r.plan_id} 已创建（账本位置 #${r.base_seq}），请预览后发布`);
+      renderPlans();
+    } catch (err) { toast(err.message, false); }
+  };
+}
+
+// ---- 表单绑定 ----
+function bindForms() {
+  $("#f-bootstrap").onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api("/api/bootstrap", { capacity: parseInt(e.target.capacity.value, 10) });
+      toast("平台已初始化"); refreshAll(); } catch (err) { toast(err.message, false); }
+  };
+  $("#f-node").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = { type: f.type.value, parent_id: f.parent_id.value };
+    if (f.node_id.value.trim()) body.node_id = f.node_id.value.trim();
+    try { const r = await api("/api/nodes", body);
+      toast(`已注册 ${TYPE_NAME[body.type]}：${r.node_id}`); f.node_id.value = ""; refreshAll(); }
+    catch (err) { toast(err.message, false); }
+  };
+  $("#f-grant").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = {
+      lessor_id: f.lessor_id.value, holder_id: f.holder_id.value,
+      amount: parseInt(f.amount.value, 10), command_id: uid("grant"),
+    };
+    const ttl = parseInt(f.ttl_seconds.value, 10);
+    if (ttl > 0) body.ttl_seconds = ttl;
+    try { const r = await api("/api/leases", body);
+      toast(`租约 ${r.lease_id} 已授予 ${body.amount}`); refreshAll(); }
+    catch (err) { toast(err.message, false); }
+  };
+  $("#f-capacity").onsubmit = async (e) => {
+    e.preventDefault();
+    try { const r = await api("/api/capacity",
+      { capacity: parseInt(e.target.capacity.value, 10) });
+      toast("全局容量已调整为 " + r.capacity); refreshAll(); }
+    catch (err) { toast(err.message, false); }
+  };
+  $("#btn-audit").onclick = () => runAudit(false);
+}
+
+let lastState = null;
+async function refreshState() {
+  try {
+    const s = await api("/api/state");
+    lastState = s;
+    renderHeader(s);
+    renderTree(s);
+    renderForms(s);
+    renderLeases(s);
+    $("#sec-plans").style.display = s.bootstrapped ? "" : "none";
+  } catch { /* 网络抖动时保留旧画面 */ }
+}
+
+async function refreshAll() {
+  await refreshState();
+  await loadEvents();
+  await runAudit(true);
+  await renderPlans();
+}
+
+bindForms();
+bindPlanForm();
+refreshAll();
+setInterval(() => { if ($("#auto").checked) refreshState(); }, 2000);
+setInterval(() => { if ($("#auto").checked) { loadEvents(); runAudit(true); renderPlans(); } }, 5000);
+</script>
+</body>
+</html>

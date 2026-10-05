@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配额服务 · 只读灾备复制器</title>
+<style>
+  :root {
+    --bg:#0f1420; --panel:#171e2e; --line:#27314a; --txt:#dfe6f5;
+    --mut:#8a97b5; --ok:#38d39f; --warn:#ffb454; --bad:#ff6b6b; --acc:#5aa1ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:13px/1.55 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; background:#121828; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .sub { color:var(--mut); font-size:12px; }
+  .wrap { padding:18px 20px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { margin:0 0 10px; font-size:13px; color:var(--acc); letter-spacing:.04em; }
+  .full { grid-column:1 / -1; }
+  .kv { display:grid; grid-template-columns:170px 1fr; gap:3px 10px; }
+  .kv .k { color:var(--mut); }
+  .kv .v { word-break:break-all; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px; border:1px solid var(--line); }
+  .ok { color:var(--ok); border-color:rgba(56,211,159,.4); }
+  .warn { color:var(--warn); border-color:rgba(255,180,84,.4); }
+  .bad { color:var(--bad); border-color:rgba(255,107,107,.4); }
+  .acc { color:var(--acc); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:500; }
+  td.num { text-align:right; }
+  button { background:#223052; color:var(--txt); border:1px solid #33508a;
+           border-radius:6px; padding:6px 12px; cursor:pointer; font-size:12px; }
+  button:hover { background:#2b3f6b; }
+  button.danger { border-color:#7a3535; background:#3a2330; }
+  input,select { background:#0e1422; border:1px solid var(--line); color:var(--txt);
+                 border-radius:6px; padding:6px 8px; font-size:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  pre { background:#0c111d; border:1px solid var(--line); border-radius:8px;
+        padding:10px; max-height:300px; overflow:auto; font-size:11px; margin:0; }
+  a { color:var(--acc); }
+  .muted { color:var(--mut); }
+  .termbox { background:#0c1420; border:1px dashed #33508a; border-radius:8px; padding:10px;
+             margin-top:8px; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>只读灾备复制器</h1>
+  <span class="sub" id="h-primary"></span>
+  <span style="flex:1"></span>
+  <span id="h-state" class="pill">…</span>
+  <span class="sub" id="h-clock"></span>
+</header>
+
+<div class="wrap">
+  <!-- 复制进度 -->
+  <div class="card">
+    <h2>复制进度 / 延迟</h2>
+    <div class="kv" id="rep-kv"></div>
+    <div class="row" style="margin-top:12px">
+      <button onclick="setPaused(false)">恢复复制</button>
+      <button class="danger" onclick="setPaused(true)">暂停复制</button>
+      <button onclick="loadAll()">立即刷新</button>
+    </div>
+  </div>
+
+  <!-- 演练 -->
+  <div class="card">
+    <h2>受控切换演练</h2>
+    <div id="active-drill" class="muted">当前无进行中的演练</div>
+    <div class="row" style="margin-top:12px">
+      <input id="d-id" placeholder="演练 ID（可空）" style="width:150px">
+      <input id="d-term" type="number" value="300" style="width:90px" title="任期秒数">
+      <span class="muted">秒任期</span>
+      <input id="d-delay" type="number" value="0" style="width:80px" title="验证窗口（毫秒，演示验证期间收到新分段）">
+      <span class="muted">ms 验证窗</span>
+      <button onclick="createDrill()">创建演练</button>
+    </div>
+    <div id="term-result"></div>
+  </div>
+
+  <!-- 隔离 -->
+  <div class="card full">
+    <h2>隔离记录（不污染最近可用截面）</h2>
+    <table id="q-table"><thead><tr>
+      <th>#</th><th>时间</th><th>分段</th><th>原因码</th><th>来源</th>
+      <th>细节</th><th>状态</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <!-- 截面内容 -->
+  <div class="card">
+    <h2>最近确认截面 · 节点余额</h2>
+    <div id="surface-sum" class="muted"></div>
+    <table id="nodes-table"><thead><tr>
+      <th>节点</th><th>类型</th><th>容量</th><th>在线</th>
+      <th class="num">可用</th><th class="num">消费</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>最近确认截面 · 租约</h2>
+    <table id="leases-table"><thead><tr>
+      <th>租约</th><th>出租→持有</th><th class="num">授予</th>
+      <th class="num">已消费</th><th>修订</th><th>状态</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>容量草案 / 命令结果</h2>
+    <div id="plans" class="muted"></div>
+    <table id="cmds-table" style="margin-top:8px"><thead><tr>
+      <th>seq</th><th>command_id</th><th>命令</th><th class="num">事件数</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>演练报告历史</h2>
+    <table id="drills-table"><thead><tr>
+      <th>演练</th><th>状态</th><th>锁定段</th><th>失败原因</th><th>创建时间</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <!-- 审计 -->
+  <div class="card full">
+    <h2>在线审计 / 审计轨迹</h2>
+    <div class="row">
+      <button onclick="runAudit()">运行全量审计</button>
+      <span id="audit-verdict" class="muted"></span>
+    </div>
+    <pre id="audit-box" class="muted">点击“运行全量审计”…</pre>
+    <pre id="audit-tail" style="margin-top:10px; max-height:220px"></pre>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString('zh-CN', {hour12:false}) : '—';
+const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const short = (s, n=14) => s ? String(s).slice(0,n) + '…' : '—';
+
+function pill(text, cls) { return `<span class="pill ${cls}">${text}</span>`; }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(data.message || r.statusText), {data, status:r.status});
+  return data;
+}
+
+async function loadStatus() {
+  const s = await api('/ops/status');
+  const r = s.replication;
+  $('h-primary').textContent = r.primary_url + ' · 段大小 ' + r.segment_size;
+  const stateEl = $('h-state');
+  stateEl.className = 'pill ' + (
+    r.paused ? 'warn'
+    : r.lag_over_limit ? 'bad'
+    : r.frozen_by_drill ? 'warn' : 'ok');
+  stateEl.textContent = r.paused ? '已暂停'
+    : r.lag_over_limit ? '落后超限·已隔离'
+    : r.frozen_by_drill ? '演练冻结'
+    : '同步中 / 已确认';
+
+  const lagPct = r.max_lag_segments ? Math.min(100, r.lag_segments / r.max_lag_segments * 100) : 0;
+  $('rep-kv').innerHTML = `
+    <div class="k">进程围栏纪元</div><div class="v">${r.epoch}</div>
+    <div class="k">确认分段边界</div><div class="v">${r.confirmed_index}
+      <span class="muted">(事件 seq ${r.confirmed_seq})</span></div>
+    <div class="k">分段链尾摘要</div><div class="v">${short(r.last_digest, 28)}</div>
+    <div class="k">截面状态摘要</div><div class="v">${short(r.state_digest, 28)}</div>
+    <div class="k">主站密封段 / tip</div><div class="v">${r.primary_sealed_index} / ${r.primary_tip_seq}
+      <span class="muted">@${fmt(r.primary_status_at)}</span></div>
+    <div class="k">落后</div><div class="v">
+      <span class="${r.lag_over_limit?'bad':''}">${r.lag_segments} 段 / ${r.lag_events} 事件</span>
+      <span class="muted">（上限 ${r.max_lag_segments} 段）</span></div>
+    <div class="k">最后拉取</div><div class="v">${fmt(r.last_pull_at)}</div>
+    <div class="k">最后错误</div><div class="v">${r.last_error ? '<span class="bad">'+esc(r.last_error)+'</span>' : '—'}</div>`;
+
+  // 隔离表
+  const qs = s.quarantine.open.concat(
+    (await api('/ops/quarantine')).records.filter(x => x.resolved_at)
+  ).slice(0, 30);
+  $('q-table').querySelector('tbody').innerHTML = s.quarantine.open_count === 0 && !qs.length
+    ? '<tr><td colspan="7" class="muted">无隔离记录</td></tr>'
+    : qs.map(q => `<tr>
+        <td>${q.id}</td><td>${fmt(q.detected_at)}</td>
+        <td>${q.segment_index ?? '—'}</td>
+        <td><span class="${q.resolved_at?'muted':'bad'}">${q.reason}</span></td>
+        <td>${esc(q.source)}</td><td>${esc(q.detail)}</td>
+        <td>${q.resolved_at ? pill('已消除 '+fmt(q.resolved_at),'ok') : pill('待处理','bad')}</td>
+      </tr>`).join('');
+
+  // 活动演练
+  if (s.drill.active) {
+    const d = await api('/ops/drills/' + s.drill.active);
+    $('active-drill').innerHTML = `
+      <b>${d.drill_id}</b> ${pill(d.state, d.state==='ISSUED'?'ok':'warn')}
+      锁定段 ${d.locked_index}
+      ${d.fail_reason ? '<span class="bad">· '+d.fail_reason+'</span>' : ''}`;
+    renderTerm(d);
+  } else {
+    $('active-drill').className = 'muted';
+    $('active-drill').textContent = '当前无进行中的演练';
+  }
+}
+
+function renderTerm(d) {
+  if (d.state === 'ISSUED' && d.term_token) {
+    const base = location.origin;
+    $('term-result').innerHTML = `<div class="termbox">
+      <b class="ok">带任期只读查询地址</b>（${Math.round((d.term_expires_at-Date.now()/1000))}s 后失效）<br>
+      截面：<a target="_blank" href="/term/${d.term_token}/state">${base}/term/${d.term_token}/state</a><br>
+      命令结果：<a target="_blank" href="/term/${d.term_token}/commands">${base}/term/${d.term_token}/commands</a><br>
+      演练报告：<a target="_blank" href="/term/${d.term_token}/summary">${base}/term/${d.term_token}/summary</a><br>
+      <span class="muted">token: ${d.term_token}</span><br>
+      <button class="danger" style="margin-top:6px" onclick="cancelDrill('${d.drill_id}')">取消演练（地址立即失效）</button>
+    </div>`;
+  } else if (d.state === 'VALIDATING') {
+    $('term-result').innerHTML = '<div class="termbox muted">验证中…（复制已冻结）</div>';
+  } else {
+    $('term-result').innerHTML = '';
+  }
+}
+
+async function loadSurface() {
+  const st = await api('/api/state');
+  $('surface-sum').innerHTML = `容量 <b>${st.global_capacity}</b> ·
+    可用合计 <b>${st.total_available}</b> · 总消费 <b>${st.total_consumed}</b>
+    · 节点 ${st.nodes.length} · 活动租约 ${st.active_lease_count}
+    · 待结算 ${st.pending_lease_count}
+    · 截面摘要 ${short(st.replica.state_digest, 20)}`;
+  $('nodes-table').querySelector('tbody').innerHTML = st.nodes.map(n => `
+    <tr><td>${n.id}</td><td>${n.type}</td><td>${n.capacity}</td>
+      <td>${n.online?'是':'<span class=bad>否</span>'}</td>
+      <td class="num ${n.available<0?'bad':''}">${n.available}</td>
+      <td class="num">${n.consumed}</td></tr>`).join('');
+  $('leases-table').querySelector('tbody').innerHTML = st.leases.length === 0
+    ? '<tr><td colspan="6" class="muted">无租约</td></tr>'
+    : st.leases.map(l => `<tr>
+      <td>${short(l.id,12)}</td>
+      <td>${short(l.lessor_id,10)} → ${short(l.holder_id,10)}</td>
+      <td class="num">${l.amount}</td><td class="num">${l.consumed}</td>
+      <td>${l.revision}</td>
+      <td>${l.status==='active'?pill('active','ok')
+          : l.status==='pending_expired'?pill('pending','warn')
+          : pill(l.status+'/'+l.reason,'muted')}</td></tr>`).join('');
+}
+
+async function loadPlansAndCommands() {
+  const plans = await api('/api/plans');
+  $('plans').innerHTML = plans.plans.length === 0
+    ? '无容量草案'
+    : plans.plans.map(p => `${pill(p.status, p.status==='published'?'ok':p.status==='discarded'?'muted':'warn')}
+        <b>${p.id}</b>（${p.changes.length} 项，base_seq ${p.base_seq}）`).join('<br>');
+  const cmds = await api('/api/commands');
+  $('cmds-table').querySelector('tbody').innerHTML = cmds.count === 0
+    ? '<tr><td colspan="4" class="muted">无命令回执</td></tr>'
+    : cmds.commands.slice(0,12).map(c => `<tr>
+      <td>${c.seq}</td><td>${short(c.command_id,26)}</td>
+      <td>${esc(c.result.command ?? '?')}</td>
+      <td class="num">${c.result.event_count ?? ''}</td></tr>`).join('');
+}
+
+async function loadDrills() {
+  const {drills} = await api('/ops/drills');
+  $('drills-table').querySelector('tbody').innerHTML = drills.length === 0
+    ? '<tr><td colspan="6" class="muted">暂无演练</td></tr>'
+    : drills.map(d => `<tr>
+      <td><a href="/ops/drills/${d.drill_id}" target="_blank">${d.drill_id}</a></td>
+      <td>${pill(d.state, d.state==='ISSUED'?'ok':d.state==='ABORTED'?'bad':d.state==='EXPIRED'?'warn':'muted')}</td>
+      <td>${d.locked_index ?? '—'}</td>
+      <td>${d.fail_reason ? '<span class=bad>'+d.fail_reason+'</span>' : '—'}</td>
+      <td>${fmt(d.created_at)}</td>
+      <td>${['VALIDATING','ISSUED'].includes(d.state)
+        ? `<button class="danger" onclick="cancelDrill('${d.drill_id}')">取消</button>` : ''}</td>
+      </tr>`).join('');
+}
+
+async function loadAuditTail() {
+  const {entries} = await api('/ops/audit-tail');
+  $('audit-tail').textContent = entries.map(e =>
+    `${fmt(e.at)}  ${e.kind.padEnd(22)}  ${JSON.stringify(e.detail)}`).join('\n')
+    || '（暂无审计轨迹）';
+}
+
+async function createDrill() {
+  try {
+    const body = {
+      drill_id: $('d-id').value || null,
+      term_seconds: Number($('d-term').value || 300),
+      validation_delay_ms: Number($('d-delay').value || 0),
+    };
+    const d = await api('/ops/drills', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (d.idempotent_replay) alert('该演练已存在，返回原结果（幂等）');
+    await loadAll();
+  } catch (e) {
+    alert('演练被拒绝：' + (e.data?.error || '') + '\n' + (e.message));
+    await loadAll();
+  }
+}
+
+async function cancelDrill(id) {
+  await api(`/ops/drills/${id}/cancel`, {method:'POST'});
+  await loadAll();
+}
+
+async function setPaused(p) {
+  await api(p ? '/ops/pause' : '/ops/resume', {method:'POST'});
+  await loadAll();
+}
+
+async function runAudit() {
+  const a = await api('/ops/audit');
+  $('audit-verdict').innerHTML = a.ok
+    ? pill('全部通过 (' + a.checks.length + ' 项)', 'ok')
+    : pill('存在失败项', 'bad');
+  $('audit-box').textContent = JSON.stringify(a, null, 2);
+  await loadAuditTail();
+}
+
+async function loadAll() {
+  try {
+    await Promise.all([loadStatus(), loadSurface(), loadPlansAndCommands(), loadDrills()]);
+    await loadAuditTail();
+  } catch (e) { /* 页面保持上次数据 */ }
+  $('h-clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+}
+
+loadAll();
+setInterval(loadAll, 2000);
+</script>
+</body>
+</html>
