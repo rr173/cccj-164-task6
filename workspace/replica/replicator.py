@@ -12,6 +12,15 @@
 已确认序号的分段重复到达 → 正文一致则忽略，正文不同则隔离；
 确认边界在 SQLite 事务里推进，进程重启从最后确认边界继续。
 
+写入所有权（滚动升级围栏）
+==========================
+滚动升级期间新旧进程短暂共用同一数据库。接替进程 ``start()`` 时先把
+``meta.epoch`` +1（夺取写入所有权），**再从存储中的权威水位重建**内存
+截面；此后旧进程的每次提交都必须在事务内通过“纪元 + 水位”条件更新
+（CAS）才会落盘。落败实例的在途工作稳定退出：轮询停止、新批次一律
+410 STALE_EPOCH、重复批次仍幂等返回首次确认结果，且拒绝事实写入
+隔离表与审计轨迹（页面/审计可见接管纪元与被拒的旧实例）。
+
 演练状态机
 ==========
 ``POST /ops/drills`` 锁定当前截面进入 VALIDATING（复制立即冻结）→
@@ -31,7 +40,7 @@ import uuid
 from typing import Any
 
 from . import verifier
-from .store import ReplicaStore, new_token
+from .store import OwnershipLost, ReplicaStore, new_token
 
 # 演练 / 复制异常原因码
 PRIMARY_UNAVAILABLE = "PRIMARY_UNAVAILABLE"
@@ -79,10 +88,13 @@ class Replicator:
         self.epoch = self.store.get_epoch()
         self.segment_size = int(self.store.meta()["segment_size"])
 
-        # 内存中的“最近完整确认截面”：启动时从持久化分段重放
-        self.segments = self.store.load_segments()
-        self.projection = verifier.replay_all(self.segments)
-        self._published_digest = verifier.state_digest(self.projection)
+        # 写入所有权：滚动升级中接替进程会把 meta.epoch +1，此后本进程的
+        # 提交一律被存储层 CAS 拒绝；检测到失去所有权后在途工作稳定退出。
+        self._ownership_lost = False
+        self._ownership_detail: str | None = None
+
+        # 内存中的“最近完整确认截面”：构造时从持久化分段重放（权威水位）
+        self._rebuild_from_store()
 
         # 主站观测
         self.primary_tip_seq = 0
@@ -110,8 +122,19 @@ class Replicator:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        # 新进程接管：纪元 +1，让任何旧纪元进程的迟到写入失效
+        # 接管顺序至关重要：先把存储纪元 +1（旧实例的提交即刻开始被 CAS
+        # 拒绝），再从存储中的权威水位重建内存截面——保证内存投影与接管
+        # 时刻的确认边界严格一致，绝不带着构造期间的陈旧水位上任。
+        prev_epoch = self.store.get_epoch()
         self.epoch = self.store.bump_epoch()
+        self._rebuild_from_store()
+        self.store.audit("epoch_takeover", {
+            "from_epoch": prev_epoch,
+            "to_epoch": self.epoch,
+            "confirmed_index": self.confirmed_index,
+            "confirmed_seq": self.confirmed_seq,
+            "state_digest": self._published_digest,
+        })
         self.store.audit("replicator_started", {
             "epoch": self.epoch,
             "confirmed_index": self.confirmed_index,
@@ -119,6 +142,13 @@ class Replicator:
         })
         self.thread.start()
         self.sweeper.start()
+
+    def _rebuild_from_store(self) -> None:
+        """从存储中的权威水位重建内存截面（构造 / 接管时调用）。"""
+        with self._lock:
+            self.segments = self.store.load_segments()
+            self.projection = verifier.replay_all(self.segments)
+            self._published_digest = verifier.state_digest(self.projection)
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -146,6 +176,61 @@ class Replicator:
                 # 截止时刻在停机期间已经到达：主动结束，旧凭证即刻稳定 410，
                 # 复制立即从停下的位置继续（poller 不再被一条死演练冻结）
                 self._expire_if_due(drill, now=now)
+
+    # ------------------------------------------------------------------
+    # 写入所有权（滚动升级围栏）
+    # ------------------------------------------------------------------
+
+    def _on_ownership_lost(
+        self, stored_epoch: int, *, source: str, detail: str | None = None
+    ) -> None:
+        """本进程已沦为旧实例：记录在案（一次）并让在途工作稳定退出。
+
+        拒绝事实进入隔离表与审计轨迹（携带本进程纪元），运维页面与审计
+        可据此展示“被哪个纪元接管、哪些旧实例的写入被拒”。
+        """
+        if self._ownership_lost:
+            return
+        self._ownership_lost = True
+        msg = detail or (
+            f"存储纪元已被接替实例提升到 {stored_epoch}（本进程纪元 {self.epoch}），"
+            "本进程在途工作稳定退出：停止拉取，后续提交/发布一律拒绝"
+        )
+        self._ownership_detail = msg
+        self._quarantine(STALE_EPOCH, msg, source=source, epoch=self.epoch)
+        self.store.audit("ownership_lost", {
+            "epoch": self.epoch,
+            "stored_epoch": stored_epoch,
+            "confirmed_index": self.confirmed_index,
+            "source": source,
+            "detail": msg,
+        })
+        self.last_error = f"{STALE_EPOCH}: {msg}"
+
+    def _assert_ownership(self, source: str) -> None:
+        """快速所有权自检：提交/发布新工作前必须仍持有当前存储纪元。
+
+        重复批次的幂等应答在本检查之前完成（只读、安全）；任何**新**工作
+        （分段提交、演练创建）都必须先通过本检查。权威保证仍在提交事务的
+        条件更新里（见 ``store.commit_segment``），这里只是快速失败并
+        让本进程尽快进入稳定退出状态。
+        """
+        if self._ownership_lost:
+            raise ReplicatorError(
+                STALE_EPOCH,
+                self._ownership_detail or "本进程已失去写入所有权",
+                status=410,
+                details={"epoch": self.epoch},
+            )
+        stored_epoch = self.store.get_epoch()
+        if stored_epoch != self.epoch:
+            self._on_ownership_lost(stored_epoch, source=source)
+            raise ReplicatorError(
+                STALE_EPOCH,
+                f"旧纪元进程的写入被拒绝（本进程 {self.epoch}，当前存储纪元 {stored_epoch}）",
+                status=410,
+                details={"epoch": self.epoch, "stored_epoch": stored_epoch},
+            )
 
     # ------------------------------------------------------------------
     # 拉取循环
@@ -224,7 +309,14 @@ class Replicator:
     def poll_once(self) -> dict[str, Any] | None:
         """一轮拉取：看主站状态 → 滞后判定 → 拉下一分段。返回应用结果。"""
         with self._lock:
-            if self.store.meta()["paused"]:
+            if self._ownership_lost:
+                return None  # 已失去写入所有权：在途工作稳定退出，不再拉取
+            meta = self.store.meta()
+            if int(meta["epoch"]) != self.epoch:
+                # 存储纪元已被接替实例提升：本进程是旧实例，稳定退出
+                self._on_ownership_lost(int(meta["epoch"]), source="poll")
+                return None
+            if meta["paused"]:
                 return None
             if self.store.active_drill() is not None:
                 return None  # 演练冻结期间不复制
@@ -331,14 +423,17 @@ class Replicator:
         index = env["segment_index"]
         digest = env["digest"]
 
-        # --- 重复拉取不重复应用（幂等优先：演练冻结期间的重复重传也安全忽略） ---
+        # --- 重复拉取不重复应用（幂等优先：演练冻结期间、乃至本进程已失去
+        # 所有权后的重复重传，都安全地只返回首次确认的原结果，不二次应用） ---
         existing = self.store.get_segment(index)
         if existing is not None:
             if existing["digest"] == digest:
                 return {
                     "outcome": "duplicate_ignored",
                     "segment_index": index,
-                    "detail": "重复拉取：分段正文与已确认分段一致，忽略",
+                    "seq_end": existing["seq_end"],
+                    "digest": existing["digest"],
+                    "detail": "重复批次：正文与已确认分段一致，返回首次确认结果，不重复应用",
                 }
             self._quarantine(
                 BODY_CONFLICT,
@@ -351,6 +446,10 @@ class Replicator:
                 details={"segment_index": index,
                          "confirmed_digest": existing["digest"], "received_digest": digest},
             )
+
+        # --- 写入所有权：新批次只允许当前纪元持有者提交（滚动升级围栏）。
+        # 旧实例在此快速失败并进入稳定退出；权威保证在提交事务的 CAS 里。 ---
+        self._assert_ownership(source)
 
         # --- 演练冻结期间收到“新”分段 ---
         drill = self.store.active_drill()
@@ -423,8 +522,23 @@ class Replicator:
             )
             raise ReplicatorError(ve.reason, ve.detail, status=422, details=ve.extra)
 
-        # --- 原子提交：分段原文 + 边界同一事务，然后原子替换投影 ---
-        self.store.commit_segment(env, new_event_hash)
+        # --- 原子提交：分段原文 + 边界在同一事务内以“纪元 + 水位”条件更新
+        # 落盘（CAS 围栏）；通过后才原子发布投影。提交失败说明本进程已失去
+        # 写入所有权：试折叠的投影直接丢弃，在途工作稳定退出。 ---
+        try:
+            self.store.commit_segment(
+                env, new_event_hash,
+                expected_epoch=self.epoch,
+                expected_prev_index=index - 1,
+            )
+        except OwnershipLost as ol:
+            self._on_ownership_lost(ol.stored_epoch, source=source, detail=str(ol))
+            raise ReplicatorError(
+                STALE_EPOCH, f"提交被拒绝：{ol}", status=410,
+                details={"epoch": ol.expected_epoch, "stored_epoch": ol.stored_epoch,
+                         "expected_index": ol.expected_index,
+                         "stored_index": ol.stored_index},
+            )
         self.segments.append(env)
         self.projection = trial
         self._published_digest = verifier.state_digest(trial)
@@ -497,6 +611,7 @@ class Replicator:
                 "confirmed_seq": self.confirmed_seq,
                 "state_digest": self._published_digest,
                 "epoch": self.epoch,
+                "ownership": "lost" if self._ownership_lost else "held",
             }
             return state
 
@@ -533,12 +648,16 @@ class Replicator:
         validation_delay_ms: int = 0,
     ) -> dict[str, Any]:
         with self._lock:
-            # 同一演练再次请求 → 返回原结果（幂等）
+            # 同一演练再次请求 → 返回原结果（幂等；只读应答，失去所有权也安全）
             if drill_id:
                 existing = self.store.get_drill(drill_id)
                 if existing is not None:
                     existing["idempotent_replay"] = True
                     return existing
+
+            # 创建演练会写入 VALIDATING 行并冻结复制：只有当前写入所有权
+            # 持有者能发起，旧实例的“在途工作”在此稳定退出（410）。
+            self._assert_ownership("drill")
 
             active = self.store.active_drill()
             if active is not None:
@@ -826,6 +945,8 @@ class Replicator:
     def status(self) -> dict[str, Any]:
         with self._lock:
             meta = self.store.meta()
+            stored_epoch = int(meta["epoch"])
+            ownership_lost = self._ownership_lost or stored_epoch != self.epoch
             lag_events = max(0, self.primary_tip_seq - meta["confirmed_seq"])
             lag_segments = max(0, self.primary_sealed_index - meta["confirmed_index"])
             drill = self.store.active_drill()
@@ -835,6 +956,10 @@ class Replicator:
                     "running": not self._stop.is_set(),
                     "paused": bool(meta["paused"]),
                     "epoch": self.epoch,
+                    "stored_epoch": stored_epoch,
+                    "ownership": "lost" if ownership_lost else "held",
+                    "ownership_detail": self._ownership_detail,
+                    "rejected_stale_writers": self.store.count_quarantined(STALE_EPOCH),
                     "segment_size": self.segment_size,
                     "confirmed_index": meta["confirmed_index"],
                     "confirmed_seq": meta["confirmed_seq"],
@@ -866,6 +991,8 @@ class Replicator:
         """离线/在线通用的全量一致性审计。"""
         with self._lock:
             stored = self.store.load_segments()
+            meta = self.store.meta()
+            stored_epoch = int(meta["epoch"])
             checks: list[dict[str, Any]] = []
             rebuilt = verifier.replay_all(stored)
             total_events = sum(len(s["events"]) for s in stored)
@@ -874,6 +1001,8 @@ class Replicator:
                 "ok": True,
                 "detail": f"{len(stored)} 个分段 / {total_events} 条事件的双链完整",
             })
+            # 连续水位：磁盘分段 1..N 连续、权威边界与磁盘尾段一致
+            checks.append(verifier.water_level_check(stored, meta))
             checks.extend(verifier.audit_projection(rebuilt)["checks"])
             digest = verifier.state_digest(rebuilt)
             checks.append({
@@ -883,11 +1012,30 @@ class Replicator:
                 if digest == self._published_digest else "磁盘重放与线上截面不一致",
             })
             checks.append(verifier.full_receipt_check(stored))
+            # 写入所有权：本进程是否仍持有当前存储纪元；被拒的旧纪元写入次数
+            rejected = self.store.count_quarantined(STALE_EPOCH)
+            ownership_ok = not self._ownership_lost and stored_epoch == self.epoch
+            checks.append({
+                "name": "epoch_ownership",
+                "ok": ownership_ok,
+                "detail": (
+                    f"进程纪元 {self.epoch} 持有当前存储纪元，写入所有权有效；"
+                    f"累计拒绝旧纪元写入 {rejected} 次"
+                    if ownership_ok else
+                    f"进程纪元 {self.epoch} 已失去写入所有权（存储纪元 "
+                    f"{stored_epoch}），本实例降为只读旧截面"
+                ),
+                "epoch": self.epoch,
+                "stored_epoch": stored_epoch,
+                "rejected_stale_writers": rejected,
+            })
             return {
                 "ok": all(c["ok"] for c in checks),
                 "checked_at": time.time(),
                 "confirmed_index": self.confirmed_index,
                 "confirmed_seq": self.confirmed_seq,
+                "epoch": self.epoch,
+                "stored_epoch": stored_epoch,
                 "state_digest": digest,
                 "checks": checks,
             }

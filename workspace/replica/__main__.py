@@ -82,11 +82,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         store = ReplicaStore(args.db, segment_size=10)  # 已存在库仅读 meta
         from . import verifier
+        from .replicator import STALE_EPOCH
 
         segments = store.load_segments()
+        meta = store.meta()
         checks = [
             {"name": "segment_hash_chain", "ok": True,
              "detail": f"{len(segments)} 个分段双链重放"},
+            # 连续水位：分段 1..N 连续、权威边界与磁盘尾段一致
+            verifier.water_level_check(segments, meta),
         ]
         rebuilt = verifier.replay_all(segments)
         checks.extend(verifier.audit_projection(rebuilt)["checks"])
@@ -94,10 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         result = {
             "ok": all(c["ok"] for c in checks),
             "db": args.db,
-            "segment_size": store.meta()["segment_size"],
-            "confirmed_index": store.meta()["confirmed_index"],
-            "confirmed_seq": store.meta()["confirmed_seq"],
-            "epoch": store.meta()["epoch"],
+            "segment_size": meta["segment_size"],
+            "confirmed_index": meta["confirmed_index"],
+            "confirmed_seq": meta["confirmed_seq"],
+            "epoch": meta["epoch"],
+            "rejected_stale_writers": store.count_quarantined(STALE_EPOCH),
             "state_digest": verifier.state_digest(rebuilt),
             "open_quarantines": store.list_quarantined(),
             "checks": checks,

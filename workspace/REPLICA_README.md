@@ -44,7 +44,7 @@ open http://localhost:8899/
 bash demo_replica.sh
 ```
 
-测试：主站 220 项 + 灾备 25 项端到端（真实 HTTP 双进程 + 真实持久化）：
+测试：主站 220 项 + 灾备 28 项端到端（真实 HTTP 双进程 + 真实持久化）：
 
 ```bash
 python3 test_service.py
@@ -93,6 +93,11 @@ python3 -m unittest test_replica
 | 10 | 投影副本折叠（复用主站领域代码） | `EVENT_APPLY_FAILED` |
 | 11 | 非负余额 / 全局守恒 / 层级 / 租约 | `PROJECTION_AUDIT_FAILED` |
 | 12 | 段内回执指向本段事件且指纹可解析 | `RECEIPT_MALFORMED` |
+
+在第 2 步（重复批次幂等应答）之后、第 3 步之前还有一道**写入所有权**
+闸门：本进程必须仍持有当前存储纪元，否则新批次一律 `410 STALE_EPOCH`
+（滚动升级围栏，见下节）；重复批次不受此限，永远只返回首次确认的原结果。
+提交落盘时在事务内以「纪元 + 水位」条件更新做最终仲裁。
 
 **落后隔离**：稳态运行中主站领先密封分段超过 `--max-lag`，复制器进入
 `LAG_OVER_LIMIT` 隔离、停止前进并明确标记，不把陈旧截面当健康截面；
@@ -143,11 +148,31 @@ ISSUED（发放不透明任期 token）
   任期继续有效；验证中崩溃的演练启动时按 `PROCESS_RESTART` 作废；
 - **并发演练**：存在 VALIDATING/ISSUED 演练时再创建 → `409 ALREADY_ACTIVE_DRILL`。
 
-## 进程纪元围栏（旧任期进程迟到更新）
+## 进程纪元围栏（写入所有权 / 滚动升级）
 
-复制器每次启动把 `meta.epoch` +1。`POST /test/ingest` 必须携带
-`X-Replica-Epoch`；纪元不匹配的迟到写入被拒绝（`410 STALE_EPOCH`）
-并写入隔离表与审计轨迹。正常轮询自动携带当前纪元。
+复制器每次启动把 `meta.epoch` +1（**夺取写入所有权**），并**先从存储中的
+权威水位重建内存截面**再开始拉取。滚动升级期间新旧进程短暂共用同一
+数据库，围栏保证落败实例绝不可能跳过别人刚提交的中间批次、继续发布
+后续批次的内存结果（那种分叉会让磁盘重算值与查询结果不一致）：
+
+- **每次提交都验证所有权**：分段确认与边界推进是同一事务里的
+  **条件更新**（`meta.epoch = 本进程纪元 AND confirmed_index = 内存水位`），
+  任一不符即整体回滚、分段与边界都不落盘；
+- **失去所有权即在途稳定退出**：轮询停止、新批次一律 `410 STALE_EPOCH`、
+  不能创建演练；拒绝事实（携带旧纪元）写入隔离表与 `ownership_lost`
+  审计，且退出是收敛的——不会反复刷隔离记录；
+- **重复批次只返回原结果**：已确认分段的重复重传（即使来自落败实例）
+  仍幂等返回首次确认结果，绝不二次应用；
+- **异常缺口仍阻挡前进**：缺口/错序分段的隔离与消除语义不受围栏影响，
+  边界不会跳过未处置的异常批次；
+- **可观测**：`/ops/status` 展示进程纪元 / 存储纪元 / 所有权状态 /
+  被拒旧实例写入次数；全量审计新增 `water_level_continuity`
+  （分段 1..N 连续、权威边界与磁盘尾段一致）与 `epoch_ownership`
+  （本进程是否仍持有当前纪元）两项检查；运维页面同步展示。
+
+`POST /test/ingest` 必须携带 `X-Replica-Epoch`；纪元不匹配的迟到写入
+被拒绝（`410 STALE_EPOCH`）并写入隔离表与审计轨迹。正常轮询自动携带
+当前纪元。
 
 ## HTTP API
 
@@ -192,9 +217,11 @@ python3 -m replica audit --db ./dr/replica.db
 python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 ```
 
-审计项：分段双链完整、非负余额、全局守恒（Σ可用+总消费=容量）、
+审计项：分段双链完整、**连续水位**（`water_level_continuity`：分段 1..N
+连续、权威边界与磁盘尾段一致）、非负余额、全局守恒（Σ可用+总消费=容量）、
 层级父子边、租约记账、磁盘重放与线上截面等价、命令回执完整且结果与
-事件推导一致。
+事件推导一致；在线审计（`GET /ops/audit`）另含 `epoch_ownership`
+（本进程纪元 vs 存储纪元、累计被拒旧纪元写入次数）。
 
 ## 持久化布局（单 SQLite）
 
@@ -218,4 +245,4 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `replica/http_server.py` | 只读查询面、任期地址、运维/演练接口、测试注入口 |
 | `replica/__main__.py` | `serve` / `audit` / `audit-tail` 命令行 |
 | `replica/static/index.html` | 运维页面（进度/延迟/隔离/截面/演练/审计） |
-| `test_replica.py` | 25 项端到端测试（含到期主动收口、并发收口、重启恢复与异常批次不跳过） |
+| `test_replica.py` | 28 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过、滚动升级写入所有权围栏） |

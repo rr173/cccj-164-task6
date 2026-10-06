@@ -88,7 +88,7 @@
     <h2>隔离记录（不污染最近可用截面）</h2>
     <table id="q-table"><thead><tr>
       <th>#</th><th>时间</th><th>分段</th><th>原因码</th><th>来源</th>
-      <th>细节</th><th>状态</th>
+      <th>纪元</th><th>细节</th><th>状态</th>
     </tr></thead><tbody></tbody></table>
   </div>
 
@@ -158,17 +158,27 @@ async function loadStatus() {
   $('h-primary').textContent = r.primary_url + ' · 段大小 ' + r.segment_size;
   const stateEl = $('h-state');
   stateEl.className = 'pill ' + (
-    r.paused ? 'warn'
+    r.ownership === 'lost' ? 'bad'
+    : r.paused ? 'warn'
     : r.lag_over_limit ? 'bad'
     : r.frozen_by_drill ? 'warn' : 'ok');
-  stateEl.textContent = r.paused ? '已暂停'
+  stateEl.textContent = r.ownership === 'lost' ? '已失去写入所有权'
+    : r.paused ? '已暂停'
     : r.lag_over_limit ? '落后超限·已隔离'
     : r.frozen_by_drill ? '演练冻结'
     : '同步中 / 已确认';
 
   const lagPct = r.max_lag_segments ? Math.min(100, r.lag_segments / r.max_lag_segments * 100) : 0;
   $('rep-kv').innerHTML = `
-    <div class="k">进程围栏纪元</div><div class="v">${r.epoch}</div>
+    <div class="k">进程围栏纪元</div><div class="v">${r.epoch}
+      <span class="muted">（存储当前纪元 ${r.stored_epoch}）</span></div>
+    <div class="k">写入所有权</div><div class="v">${r.ownership === 'lost'
+      ? pill('已失去 · 在途工作已退出', 'bad')
+      : pill('持有 · 可提交', 'ok')}
+      ${r.ownership_detail ? '<div class="muted">' + esc(r.ownership_detail) + '</div>' : ''}</div>
+    <div class="k">被拒旧实例写入</div><div class="v">${r.rejected_stale_writers > 0
+      ? '<span class="bad">' + r.rejected_stale_writers + ' 次</span>'
+      : '0 次'}</div>
     <div class="k">确认分段边界</div><div class="v">${r.confirmed_index}
       <span class="muted">(事件 seq ${r.confirmed_seq})</span></div>
     <div class="k">分段链尾摘要</div><div class="v">${short(r.last_digest, 28)}</div>
@@ -186,12 +196,13 @@ async function loadStatus() {
     (await api('/ops/quarantine')).records.filter(x => x.resolved_at)
   ).slice(0, 30);
   $('q-table').querySelector('tbody').innerHTML = s.quarantine.open_count === 0 && !qs.length
-    ? '<tr><td colspan="7" class="muted">无隔离记录</td></tr>'
+    ? '<tr><td colspan="8" class="muted">无隔离记录</td></tr>'
     : qs.map(q => `<tr>
         <td>${q.id}</td><td>${fmt(q.detected_at)}</td>
         <td>${q.segment_index ?? '—'}</td>
         <td><span class="${q.resolved_at?'muted':'bad'}">${q.reason}</span></td>
-        <td>${esc(q.source)}</td><td>${esc(q.detail)}</td>
+        <td>${esc(q.source)}</td><td>${q.epoch ?? '—'}</td>
+        <td>${esc(q.detail)}</td>
         <td>${q.resolved_at ? pill('已消除 '+fmt(q.resolved_at),'ok') : pill('待处理','bad')}</td>
       </tr>`).join('');
 

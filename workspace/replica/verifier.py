@@ -473,6 +473,62 @@ def full_receipt_check(all_segments: list[dict[str, Any]]) -> dict[str, Any]:
 # 全量重放（演练 / 启动审计用）
 # ----------------------------------------------------------------------
 
+def water_level_check(
+    all_segments: list[dict[str, Any]], meta: dict[str, Any]
+) -> dict[str, Any]:
+    """连续水位检查：磁盘上的已确认分段必须是 1..N 连续、事件 seq 段间
+    衔接，且 meta 中的权威边界（index/seq/尾摘要）与最后一段完全一致。
+
+    滚动升级中若曾有实例跳过中间批次提交后续批次，水位会出现断档或
+    边界与磁盘尾段不符，本检查会立即暴露。
+    """
+    problems: list[str] = []
+    expected = 1
+    prev_end = 0
+    for s in all_segments:
+        if s["segment_index"] != expected:
+            problems.append(
+                f"分段序号断档：期望 {expected}，磁盘上为 {s['segment_index']}"
+            )
+            break
+        if s["seq_start"] != prev_end + 1:
+            problems.append(
+                f"事件 seq 在分段 {expected} 处断档：期望起始 {prev_end + 1}，"
+                f"实际 {s['seq_start']}"
+            )
+            break
+        prev_end = s["seq_end"]
+        expected += 1
+    last = all_segments[-1] if all_segments else None
+    tail_index = last["segment_index"] if last else 0
+    tail_seq = last["seq_end"] if last else 0
+    tail_digest = last["digest"] if last else GENESIS_DIGEST
+    if int(meta["confirmed_index"]) != tail_index:
+        problems.append(
+            f"权威边界 confirmed_index={meta['confirmed_index']} "
+            f"与磁盘最后分段 {tail_index} 不符"
+        )
+    if int(meta["confirmed_seq"]) != tail_seq:
+        problems.append(
+            f"权威边界 confirmed_seq={meta['confirmed_seq']} "
+            f"与磁盘最后事件 seq {tail_seq} 不符"
+        )
+    if meta["last_digest"] != tail_digest:
+        problems.append("权威尾摘要与磁盘最后分段 digest 不符")
+    ok = not problems
+    return {
+        "name": "water_level_continuity",
+        "ok": ok,
+        "detail": (
+            f"水位连续：分段 1..{tail_index}、事件 seq 1..{tail_seq}，"
+            "权威边界与磁盘尾段一致"
+            if ok else "; ".join(problems)
+        ),
+        "confirmed_index": tail_index,
+        "confirmed_seq": tail_seq,
+    }
+
+
 def replay_all(all_segments: list[dict[str, Any]]) -> Projection:
     """从空投影折叠全部已确认分段。"""
     p = Projection()

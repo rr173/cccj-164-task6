@@ -12,6 +12,14 @@ audit_log                  只追加审计轨迹（拉取、隔离、演练、�
 
 确认边界（meta.confirmed_index）与分段写入在**同一事务**提交：
 崩溃重启后要么整个分段已确认，要么完全不存在，绝无半截截面。
+
+写入所有权（滚动升级围栏）
+==========================
+滚动升级期间新旧两个进程会短暂共用同一数据库。新进程接管时把
+``meta.epoch`` +1；此后旧进程的每一次提交都必须在**同一事务内**
+用条件更新（CAS）确认“存储纪元仍是自己持有的纪元、且内存水位与
+存储权威水位一致”，任一不符即整体回滚并抛 :class:`OwnershipLost`。
+这样落败实例绝不可能跳过别人刚提交的中间批次、继续发布后续批次。
 """
 
 from __future__ import annotations
@@ -89,6 +97,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
 GENESIS_HASH = "0" * 64
 
 
+class OwnershipLost(Exception):
+    """提交时写入所有权校验失败：本进程已沦为旧实例（或水位已发散）。
+
+    携带存储侧权威值，供上层记录“被谁接管 / 水位差多少”。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected_epoch: int,
+        stored_epoch: int,
+        expected_index: int,
+        stored_index: int,
+    ):
+        super().__init__(message)
+        self.expected_epoch = expected_epoch
+        self.stored_epoch = stored_epoch
+        self.expected_index = expected_index
+        self.stored_index = stored_index
+
+
 def new_token() -> str:
     return "drill-" + uuid.uuid4().hex
 
@@ -149,10 +179,50 @@ class ReplicaStore:
     # ------------------------------------------------------------------
 
     def commit_segment(
-        self, env: dict[str, Any], last_event_hash: str
+        self,
+        env: dict[str, Any],
+        last_event_hash: str,
+        *,
+        expected_epoch: int,
+        expected_prev_index: int,
     ) -> None:
-        """分段确认 + 边界推进，单事务原子提交。"""
+        """分段确认 + 边界推进，单事务原子提交，且带写入所有权围栏。
+
+        边界推进是一条**条件更新**：仅当 ``meta.epoch`` 仍等于本进程持有的
+        纪元、且 ``meta.confirmed_index`` 仍等于本进程内存水位
+        （``expected_prev_index``）时才生效。滚动升级中接替实例已提升纪元
+        （或同纪元的写入者已推进水位）时，条件更新命中 0 行，整个事务回滚
+        ——分段原文与边界要么一起落盘，要么一起不落，落败进程抛
+        :class:`OwnershipLost`，绝不能带着遗漏中间批次的内存状态继续提交。
+        """
         with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE meta SET confirmed_index = ?, confirmed_seq = ?,"
+                " last_digest = ?, last_event_hash = ?, updated_at = ?"
+                " WHERE id = 1 AND epoch = ? AND confirmed_index = ?",
+                (
+                    env["segment_index"],
+                    env["seq_end"],
+                    env["digest"],
+                    last_event_hash,
+                    time.time(),
+                    expected_epoch,
+                    expected_prev_index,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = self.conn.execute(
+                    "SELECT epoch, confirmed_index FROM meta WHERE id = 1"
+                ).fetchone()
+                raise OwnershipLost(
+                    f"写入所有权已丢失：本进程纪元 {expected_epoch}/水位 "
+                    f"{expected_prev_index}，存储纪元 {row['epoch']}/水位 "
+                    f"{row['confirmed_index']}；提交已回滚",
+                    expected_epoch=expected_epoch,
+                    stored_epoch=int(row["epoch"]),
+                    expected_index=expected_prev_index,
+                    stored_index=int(row["confirmed_index"]),
+                )
             self.conn.execute(
                 "INSERT INTO segments (segment_index, seq_start, seq_end, prev_digest,"
                 " digest, envelope_json, applied_at) VALUES (?,?,?,?,?,?,?)",
@@ -163,17 +233,6 @@ class ReplicaStore:
                     env["prev_digest"],
                     env["digest"],
                     canonical(env),
-                    time.time(),
-                ),
-            )
-            self.conn.execute(
-                "UPDATE meta SET confirmed_index = ?, confirmed_seq = ?,"
-                " last_digest = ?, last_event_hash = ?, updated_at = ? WHERE id = 1",
-                (
-                    env["segment_index"],
-                    env["seq_end"],
-                    env["digest"],
-                    last_event_hash,
                     time.time(),
                 ),
             )
@@ -247,6 +306,13 @@ class ReplicaStore:
             "SELECT 1 FROM quarantined WHERE resolved_at IS NULL LIMIT 1"
         ).fetchone()
         return r is not None
+
+    def count_quarantined(self, reason: str) -> int:
+        """某原因码的隔离记录总数（含已消除）——如被拒的旧纪元写入次数。"""
+        r = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM quarantined WHERE reason = ?", (reason,)
+        ).fetchone()
+        return int(r["c"])
 
     # ------------------------------------------------------------------
     # drills
