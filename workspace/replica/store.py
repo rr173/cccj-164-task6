@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS segments (
     prev_digest    TEXT NOT NULL,
     digest         TEXT NOT NULL UNIQUE,
     envelope_json  TEXT NOT NULL,
+    epoch          INTEGER,
     applied_at     REAL NOT NULL
 );
 
@@ -103,6 +104,10 @@ class ReplicaStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
+        # 旧库迁移：分段表补“确认该批的接管纪元”列（历史行留 NULL）
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(segments)")}
+        if "epoch" not in cols:
+            self.conn.execute("ALTER TABLE segments ADD COLUMN epoch INTEGER")
         self.conn.commit()
         if first_time:
             with self.conn:
@@ -148,35 +153,103 @@ class ReplicaStore:
     # segments
     # ------------------------------------------------------------------
 
-    def commit_segment(
-        self, env: dict[str, Any], last_event_hash: str
-    ) -> None:
-        """分段确认 + 边界推进，单事务原子提交。"""
-        with self.lock, self.conn:
-            self.conn.execute(
-                "INSERT INTO segments (segment_index, seq_start, seq_end, prev_digest,"
-                " digest, envelope_json, applied_at) VALUES (?,?,?,?,?,?,?)",
-                (
-                    env["segment_index"],
-                    env["seq_start"],
-                    env["seq_end"],
-                    env["prev_digest"],
-                    env["digest"],
-                    canonical(env),
-                    time.time(),
-                ),
-            )
-            self.conn.execute(
-                "UPDATE meta SET confirmed_index = ?, confirmed_seq = ?,"
-                " last_digest = ?, last_event_hash = ?, updated_at = ? WHERE id = 1",
-                (
-                    env["segment_index"],
-                    env["seq_end"],
-                    env["digest"],
-                    last_event_hash,
-                    time.time(),
-                ),
-            )
+    # 所有权围栏提交结果
+    COMMIT_CONFIRMED = "confirmed"
+    COMMIT_DUPLICATE = "duplicate"
+    COMMIT_BODY_CONFLICT = "body_conflict"
+    COMMIT_ADVANCED = "advanced"
+    COMMIT_OWNERSHIP_LOST = "ownership_lost"
+
+    def commit_segment_if_owner(
+        self, env: dict[str, Any], last_event_hash: str, owner_epoch: int,
+    ) -> dict[str, Any]:
+        """写入所有权围栏下的分段确认（单事务原子 CAS）。
+
+        滚动升级期间可能有两个进程共用同一 DB：提交时在**同一事务**内核对
+        ``meta.epoch`` 仍是调用方持有的纪元，且边界恰好停在前一段。只有仍是
+        当前纪元主人的进程才能落盘；旧纪元进程的在途提交（哪怕校验全做完了）
+        被稳定拒绝，绝不让“漏掉别人刚提交的中间批次”的内存结果污染磁盘。
+
+        返回结果类别：
+
+        * ``confirmed``      —— 本事务成功写入分段并推进边界；
+        * ``duplicate``      —— 该序号已由当前纪元确认且正文一致（幂等原结果）；
+        * ``body_conflict``  —— 该序号已被确认但正文不同（分叉）；
+        * ``advanced``       —— 权威水位已越过本序号（缺口被别人补齐），
+                                同时带回重算后的当前边界；
+        * ``ownership_lost`` —— 纪元已被接替进程提升，调用方必须稳定退出。
+        """
+        now = time.time()
+        index = env["segment_index"]
+        digest = env["digest"]
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT epoch, confirmed_index, confirmed_seq, last_digest,"
+                    " last_event_hash FROM meta WHERE id = 1"
+                ).fetchone()
+                current_epoch = int(row["epoch"])
+                confirmed_index = int(row["confirmed_index"])
+                if current_epoch != owner_epoch:
+                    self.conn.rollback()
+                    return {
+                        "outcome": self.COMMIT_OWNERSHIP_LOST,
+                        "segment_index": index,
+                        "owner_epoch": owner_epoch,
+                        "current_epoch": current_epoch,
+                        "confirmed_index": confirmed_index,
+                    }
+                if index <= confirmed_index:
+                    existing = self.conn.execute(
+                        "SELECT digest FROM segments WHERE segment_index = ?",
+                        (index,),
+                    ).fetchone()
+                    same = existing is not None and existing["digest"] == digest
+                    self.conn.rollback()
+                    return {
+                        "outcome": (self.COMMIT_DUPLICATE if same
+                                    else self.COMMIT_BODY_CONFLICT),
+                        "segment_index": index,
+                        "confirmed_index": confirmed_index,
+                        "confirmed_digest": existing["digest"] if existing else None,
+                    }
+                if index != confirmed_index + 1:
+                    self.conn.rollback()
+                    return {
+                        "outcome": self.COMMIT_ADVANCED,
+                        "segment_index": index,
+                        "confirmed_index": confirmed_index,
+                        "confirmed_seq": int(row["confirmed_seq"]),
+                        "last_digest": row["last_digest"],
+                        "last_event_hash": row["last_event_hash"],
+                    }
+                self.conn.execute(
+                    "INSERT INTO segments (segment_index, seq_start, seq_end,"
+                    " prev_digest, digest, envelope_json, epoch, applied_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        index,
+                        env["seq_start"],
+                        env["seq_end"],
+                        env["prev_digest"],
+                        digest,
+                        canonical(env),
+                        owner_epoch,
+                        now,
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE meta SET confirmed_index = ?, confirmed_seq = ?,"
+                    " last_digest = ?, last_event_hash = ?, updated_at = ? WHERE id = 1",
+                    (index, env["seq_end"], digest, last_event_hash, now),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return {"outcome": self.COMMIT_CONFIRMED, "segment_index": index,
+                "seq_end": env["seq_end"], "digest": digest}
 
     def load_segments(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -195,6 +268,14 @@ class ReplicaStore:
             "SELECT segment_index, digest FROM segments ORDER BY segment_index"
         ).fetchall()
         return {int(r["segment_index"]): r["digest"] for r in rows}
+
+    def segment_epochs(self) -> dict[int, int | None]:
+        """每个已确认分段是由哪个接管纪元提交的（连续水位的归属视图）。"""
+        rows = self.conn.execute(
+            "SELECT segment_index, epoch FROM segments ORDER BY segment_index"
+        ).fetchall()
+        return {int(r["segment_index"]): (int(r["epoch"]) if r["epoch"] is not None else None)
+                for r in rows}
 
     # ------------------------------------------------------------------
     # quarantined

@@ -46,6 +46,7 @@ REPLICATION_PAUSED = "REPLICATION_PAUSED"
 TERM_EXPIRED = "TERM_EXPIRED"
 PROCESS_RESTART = "PROCESS_RESTART"
 BODY_CONFLICT = "BODY_CONFLICT"
+OWNERSHIP_LOST = "OWNERSHIP_LOST"
 
 
 class ReplicatorError(Exception):
@@ -79,6 +80,11 @@ class Replicator:
         self.epoch = self.store.get_epoch()
         self.segment_size = int(self.store.meta()["segment_size"])
 
+        # 写入所有权围栏：失主（存储纪元已被接替实例提升）后永久置位。
+        # 失主进程的在途提交/发布全部被拒，后台循环自行停摆。
+        self._ownership_lost = False
+        self.ownership_lost_at: float | None = None
+
         # 内存中的“最近完整确认截面”：启动时从持久化分段重放
         self.segments = self.store.load_segments()
         self.projection = verifier.replay_all(self.segments)
@@ -110,8 +116,11 @@ class Replicator:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        # 新进程接管：纪元 +1，让任何旧纪元进程的迟到写入失效
+        # 新进程接管：先提升纪元取得写入所有权，再从存储中的权威水位重建
+        # 内存状态——顺序不能反：纪元一旦提升，任何旧纪元进程的迟到提交都会
+        # 被存储层 CAS 拒绝，而本进程在权威水位重建完成前绝不发布内存结果。
         self.epoch = self.store.bump_epoch()
+        self._rebuild_from_authoritative()
         self.store.audit("replicator_started", {
             "epoch": self.epoch,
             "confirmed_index": self.confirmed_index,
@@ -122,6 +131,50 @@ class Replicator:
 
     def shutdown(self) -> None:
         self._stop.set()
+
+    def _rebuild_from_authoritative(self) -> None:
+        """从存储中的权威水位完整重建内存状态。
+
+        接替实例接管、或发现权威水位已被并行推进时，绝不允许“漏过别人刚
+        提交的中间批次、继续发布后续批次内存结果”：丢弃全部在途内存状态，
+        重新加载已确认分段并完整重放，使磁盘重算值与查询结果严格一致。
+        """
+        self.segments = self.store.load_segments()
+        self.projection = verifier.replay_all(self.segments)
+        self._published_digest = verifier.state_digest(self.projection)
+
+    def _storage_epoch(self) -> int:
+        return int(self.store.meta()["epoch"])
+
+    def _demote_lost_owner(self, current_epoch: int, *, detail: str,
+                           source: str = "poll") -> None:
+        """失去写入所有权后的稳定退出：重建到权威水位 + 永久停摆。
+
+        - 先把内存截面重建到存储权威水位（查询不再返回漏批的陈旧结果）；
+        - 置失主标记并停止后台拉取/sweep，本进程不再产生任何在途写入；
+        - 留下隔离记录与审计轨迹，页面/审计可见“被拒的旧实例”与接管纪元。
+        重复调用幂等（只记录第一次失主）。
+        """
+        self._rebuild_from_authoritative()
+        already_lost = self._ownership_lost
+        self._ownership_lost = True
+        if self.ownership_lost_at is None:
+            self.ownership_lost_at = time.time()
+        self._stop.set()
+        if not already_lost:
+            self.store.quarantine(
+                OWNERSHIP_LOST, detail, source,
+                epoch=self.epoch,
+                envelope_digest_value=None,
+            )
+            self.store.audit("ownership_lost", {
+                "lost_epoch": self.epoch,
+                "current_epoch": current_epoch,
+                "authoritative_index": self.confirmed_index,
+                "state_digest": self._published_digest,
+                "detail": detail,
+            })
+        self.last_error = f"{OWNERSHIP_LOST}: {detail}"
 
     def _recover_drills_on_startup(self) -> None:
         """进程启动时统一收口遗留演练（不依赖后台线程的首个 tick）。"""
@@ -181,6 +234,8 @@ class Replicator:
         now = now if now is not None else time.time()
         expired: list[str] = []
         with self._lock:
+            if self._ownership_lost:
+                return expired  # 失主进程不再收口演练：交给持有当前纪元的实例
             for drill in self.store.list_active_drills():
                 if (
                     drill["state"] == "ISSUED"
@@ -224,6 +279,17 @@ class Replicator:
     def poll_once(self) -> dict[str, Any] | None:
         """一轮拉取：看主站状态 → 滞后判定 → 拉下一分段。返回应用结果。"""
         with self._lock:
+            if self._ownership_lost:
+                return None  # 失主进程稳定退出，不再发起任何在途写入
+            # 每次提交前先与存储中的权威纪元对账：已被接替实例接管则退出
+            storage_epoch = self._storage_epoch()
+            if storage_epoch != self.epoch:
+                self._demote_lost_owner(
+                    storage_epoch,
+                    detail=(f"轮询前发现存储纪元 {storage_epoch} 已不是本实例"
+                            f"持有的 {self.epoch}，旧实例停止在途工作"),
+                )
+                return None
             if self.store.meta()["paused"]:
                 return None
             if self.store.active_drill() is not None:
@@ -306,17 +372,19 @@ class Replicator:
     ) -> dict[str, Any]:
         """外部注入分段（测试/补拉）。走与轮询完全相同的准入路径。"""
         with self._lock:
-            if epoch is not None and epoch != self.epoch:
+            # 纪元以存储中的权威值为准（接替实例可能已经把纪元抬高）
+            storage_epoch = self._storage_epoch()
+            if epoch is not None and epoch != storage_epoch:
                 self._quarantine(
                     STALE_EPOCH,
-                    f"迟到写入来自旧纪元进程（收到 {epoch}，当前 {self.epoch}），已拒绝",
+                    f"迟到写入来自旧纪元进程（收到 {epoch}，当前 {storage_epoch}），已拒绝",
                     source=source,
                     envelope_digest_value=env.get("digest") if isinstance(env, dict) else None,
                     epoch=epoch,
                 )
                 raise ReplicatorError(
                     STALE_EPOCH, "旧纪元进程的迟到更新被拒绝", status=410,
-                    details={"received_epoch": epoch, "current_epoch": self.epoch},
+                    details={"received_epoch": epoch, "current_epoch": storage_epoch},
                 )
             return self._ingest_locked(env, source=source)
 
@@ -331,15 +399,29 @@ class Replicator:
         index = env["segment_index"]
         digest = env["digest"]
 
-        # --- 重复拉取不重复应用（幂等优先：演练冻结期间的重复重传也安全忽略） ---
+        # 新批次（非重复）准入前先确认仍持有当前纪元。失主的在途提交必须
+        # 稳定退出，绝不允许它推进内存投影——那正是“漏掉别人刚提交的中间
+        # 批次、却继续发布后续批次内存结果”的缺陷根源。
+        owner_epoch = self.epoch
+        storage_epoch = self._storage_epoch()
+        lost = self._ownership_lost or storage_epoch != owner_epoch
+
+        # --- 重复批次：只能返回原结果（幂等优先于所有权判定）。
+        #     失主重复重传别人已确认的批次不再被拒绝，但也不产生任何写入：
+        #     内存落后于权威水位时先重建，保证返回的不是漏批截面。 ---
         existing = self.store.get_segment(index)
         if existing is not None:
             if existing["digest"] == digest:
+                # 重复批次只能返回原结果：不产生任何写入，也不改变所有权状态。
+                # 内存落后于权威水位时先重建，保证返回的不是漏批截面。
+                if self.confirmed_index != len(self.segments):
+                    self._rebuild_from_authoritative()
                 return {
                     "outcome": "duplicate_ignored",
                     "segment_index": index,
-                    "detail": "重复拉取：分段正文与已确认分段一致，忽略",
+                    "detail": "重复批次：分段正文与已确认分段一致，返回原结果",
                 }
+            # 同序号正文不同是数据分叉：失主也按隔离处理（不产生新写入）
             self._quarantine(
                 BODY_CONFLICT,
                 f"同序号 {index} 正文不同：已确认 {existing['digest'][:16]}…，"
@@ -350,6 +432,21 @@ class Replicator:
                 BODY_CONFLICT, f"分段 {index} 同序号正文不同，已隔离", status=409,
                 details={"segment_index": index,
                          "confirmed_digest": existing["digest"], "received_digest": digest},
+            )
+
+        if lost:
+            self._demote_lost_owner(
+                storage_epoch,
+                detail=(f"分段提交被所有权围栏拒绝：存储纪元 {storage_epoch}"
+                        f" ≠ 本实例纪元 {owner_epoch}，旧实例停止在途工作"),
+                source=source,
+            )
+            raise ReplicatorError(
+                OWNERSHIP_LOST,
+                f"本实例已失去纪元 {owner_epoch} 的写入所有权"
+                f"（当前纪元 {storage_epoch}），在途工作稳定退出",
+                status=410,
+                details={"lost_epoch": owner_epoch, "current_epoch": storage_epoch},
             )
 
         # --- 演练冻结期间收到“新”分段 ---
@@ -373,18 +470,25 @@ class Replicator:
                 details={"drill_id": drill["drill_id"]},
             )
 
-        # --- 序号必须正好是下一段（错序/缺失隔离） ---
-        expected_index = self.confirmed_index + 1
+        # --- 序号必须正好是下一段（错序/缺失隔离）。权威水位以存储为准：
+        #     内存可能落后于已被别的进程确认的批次，此时先重建再判缺口，
+        #     异常缺口（仍缺中段）依旧阻挡前进。 ---
+        if self.confirmed_index != len(self.segments):
+            self._rebuild_from_authoritative()
+        confirmed_index = self.confirmed_index
+        expected_index = confirmed_index + 1
         if index != expected_index:
             reason = verifier.SEGMENT_INDEX_MISMATCH if index > expected_index else BODY_CONFLICT
-            detail = (f"分段错序：期望 {expected_index}，收到 {index}"
+            detail = (f"分段错序：期望 {expected_index}，收到 {index}，"
+                      f"异常缺口未补齐前禁止前进"
                       if index > expected_index
-                      else f"收到早于确认边界的旧分段 {index}（边界 {self.confirmed_index}）")
+                      else f"收到早于确认边界的旧分段 {index}（边界 {confirmed_index}）")
             self._quarantine(reason, detail, source, index, digest)
             raise ReplicatorError(reason, detail, status=409)
 
         # --- 本地自校验：大小/序号连续/前段摘要/信封摘要/事件链/折叠/守恒 ---
-        # 先查自身：自身不一致（被篡改）按具体断裂原因隔离，而不是笼统的分叉
+        # 先查自身：自身不一致（被篡改）按具体断裂原因隔离，而不是笼统的分叉。
+        # 边界值此刻重新取自存储权威行，与随后的提交 CAS 使用同一前置条件。
         meta = self.store.meta()
         try:
             verifier.check_index_and_size(env, expected_index, self.segment_size)
@@ -423,8 +527,103 @@ class Replicator:
             )
             raise ReplicatorError(ve.reason, ve.detail, status=422, details=ve.extra)
 
-        # --- 原子提交：分段原文 + 边界同一事务，然后原子替换投影 ---
-        self.store.commit_segment(env, new_event_hash)
+        # --- 所有权围栏提交：存储层在同一事务内核对纪元与连续水位。
+        #     即使校验全部做完后才与接替实例相撞，失主提交也会被稳定拒绝。 ---
+        committed = self.store.commit_segment_if_owner(env, new_event_hash, owner_epoch)
+        outcome = committed["outcome"]
+
+        if outcome == self.store.COMMIT_OWNERSHIP_LOST:
+            current_epoch = committed["current_epoch"]
+            self._demote_lost_owner(
+                current_epoch,
+                detail=(f"分段 {index} 提交时发现纪元已被接替实例接管"
+                        f"（{owner_epoch} → {current_epoch}），本实例在途工作退出"),
+                source=source,
+            )
+            raise ReplicatorError(
+                OWNERSHIP_LOST,
+                f"提交时分段 {index} 的写入所有权已属于纪元 {current_epoch}",
+                status=410,
+                details={"lost_epoch": owner_epoch, "current_epoch": current_epoch},
+            )
+
+        if outcome == self.store.COMMIT_DUPLICATE:
+            # 提交窗口内被并行进程抢先确认了同一批次（正文一致）：
+            # 重复批次只返回原结果，并先重建到权威水位。
+            self._rebuild_from_authoritative()
+            return {
+                "outcome": "duplicate_ignored",
+                "segment_index": index,
+                "detail": "重复批次：已由当前纪元确认且正文一致，返回原结果",
+            }
+
+        if outcome == self.store.COMMIT_BODY_CONFLICT:
+            confirmed_digest = committed["confirmed_digest"]
+            self._rebuild_from_authoritative()
+            self._quarantine(
+                BODY_CONFLICT,
+                f"提交时同序号 {index} 已被确认且正文不同："
+                f"已确认 {str(confirmed_digest)[:16]}…，本次 {digest[:16]}…",
+                source=source, segment_index=index, envelope_digest_value=digest,
+            )
+            raise ReplicatorError(
+                BODY_CONFLICT, f"分段 {index} 同序号正文不同，已隔离", status=409,
+                details={"segment_index": index,
+                         "confirmed_digest": confirmed_digest, "received_digest": digest},
+            )
+
+        if outcome == self.store.COMMIT_ADVANCED:
+            # 提交前的瞬间别人补齐了缺口并把权威水位推过了本序号：
+            # 先按权威水位重建（不漏批），再按既有结果/分叉/缺口分类。
+            self._rebuild_from_authoritative()
+            advanced_existing = self.store.get_segment(index)
+            if advanced_existing is not None:
+                if advanced_existing["digest"] == digest:
+                    return {
+                        "outcome": "duplicate_ignored",
+                        "segment_index": index,
+                        "detail": "重复批次：缺口已由当前纪元补齐且正文一致，返回原结果",
+                    }
+                self._quarantine(
+                    BODY_CONFLICT,
+                    f"权威水位推进后同序号 {index} 正文不同，已隔离",
+                    source=source, segment_index=index, envelope_digest_value=digest,
+                )
+                raise ReplicatorError(
+                    BODY_CONFLICT, f"分段 {index} 与权威水位同序号正文不同", status=409,
+                    details={"segment_index": index,
+                             "confirmed_digest": advanced_existing["digest"],
+                             "received_digest": digest},
+                )
+            # 水位越过本序号却查不到本序号分段：链路异常，隔离阻挡前进
+            self._quarantine(
+                verifier.SEGMENT_INDEX_MISMATCH,
+                f"权威水位已推进到 {committed['confirmed_index']} 但分段 {index} 缺失",
+                source=source, segment_index=index, envelope_digest_value=digest,
+            )
+            raise ReplicatorError(
+                verifier.SEGMENT_INDEX_MISMATCH,
+                f"权威水位异常：分段 {index} 缺失", status=409,
+            )
+
+        # --- 发布前最后一次所有权确认：提交后、发布内存结果前若已失主，
+        #     不发布本进程的在途内存结果，改为从权威水位重建。 ---
+        final_epoch = self._storage_epoch()
+        if final_epoch != owner_epoch:
+            self._rebuild_from_authoritative()
+            self._demote_lost_owner(
+                final_epoch,
+                detail=(f"分段 {index} 落盘后发布前纪元被接管"
+                        f"（{owner_epoch} → {final_epoch}），放弃在途内存发布"),
+                source=source,
+            )
+            raise ReplicatorError(
+                OWNERSHIP_LOST,
+                f"发布前已失去纪元 {owner_epoch} 的写入所有权", status=410,
+                details={"lost_epoch": owner_epoch, "current_epoch": final_epoch},
+            )
+
+        # --- 提交与发布都确认仍持有当前纪元：原子替换内存投影 ---
         self.segments.append(env)
         self.projection = trial
         self._published_digest = verifier.state_digest(trial)
@@ -435,6 +634,7 @@ class Replicator:
             "seq_end": env["seq_end"],
             "digest": digest,
             "source": source,
+            "epoch": owner_epoch,
             "state_digest": self._published_digest,
         })
         return {
@@ -442,6 +642,7 @@ class Replicator:
             "segment_index": index,
             "seq_end": env["seq_end"],
             "digest": digest,
+            "epoch": owner_epoch,
             "state_digest": self._published_digest,
         }
 
@@ -488,8 +689,19 @@ class Replicator:
     def confirmed_seq(self) -> int:
         return int(self.store.meta()["confirmed_seq"])
 
+    def _serve_authoritative_if_lost(self) -> None:
+        """失主实例的读路径：每次从存储权威水位重建，查询永不滞后于磁盘。
+
+        失主进程已停摆、不再是热路径；接管实例可能继续推进水位，因此读前
+        总是丢弃本地在途内存、完整重放已确认分段，保证查询结果与磁盘重算
+        值严格一致，而不是停在失主那一刻的旧快照。
+        """
+        if self._ownership_lost:
+            self._rebuild_from_authoritative()
+
     def current_state(self) -> dict[str, Any]:
         with self._lock:
+            self._serve_authoritative_if_lost()
             state = self.projection.to_state()
             state["server_time"] = None  # 灾备截面不带实时时钟，避免误读
             state["replica"] = {
@@ -497,11 +709,14 @@ class Replicator:
                 "confirmed_seq": self.confirmed_seq,
                 "state_digest": self._published_digest,
                 "epoch": self.epoch,
+                "authoritative_epoch": self._storage_epoch(),
+                "ownership_lost": self._ownership_lost,
             }
             return state
 
     def commands_view(self, limit: int = 200) -> dict[str, Any]:
         with self._lock:
+            self._serve_authoritative_if_lost()
             receipts: list[dict[str, Any]] = []
             for env in self.segments:
                 receipts.extend(env.get("receipts", []))
@@ -514,6 +729,7 @@ class Replicator:
 
     def receipt(self, command_id: str) -> dict[str, Any] | None:
         with self._lock:
+            self._serve_authoritative_if_lost()
             for env in reversed(self.segments):
                 for r in env.get("receipts", []):
                     if r["command_id"] == command_id:
@@ -533,6 +749,14 @@ class Replicator:
         validation_delay_ms: int = 0,
     ) -> dict[str, Any]:
         with self._lock:
+            if self._ownership_lost or self._storage_epoch() != self.epoch:
+                raise ReplicatorError(
+                    OWNERSHIP_LOST,
+                    "本实例已失去写入所有权，受控切换演练由当前纪元实例发起",
+                    status=410,
+                    details={"lost_epoch": self.epoch,
+                             "current_epoch": self._storage_epoch()},
+                )
             # 同一演练再次请求 → 返回原结果（幂等）
             if drill_id:
                 existing = self.store.get_drill(drill_id)
@@ -818,6 +1042,14 @@ class Replicator:
 
     def set_paused(self, paused: bool) -> dict[str, Any]:
         with self._lock:
+            if self._ownership_lost:
+                raise ReplicatorError(
+                    OWNERSHIP_LOST,
+                    "本实例已失去写入所有权，暂停/恢复操作由当前纪元实例负责",
+                    status=410,
+                    details={"lost_epoch": self.epoch,
+                             "current_epoch": self._storage_epoch()},
+                )
             self.store.set_paused(paused)
             self.store.audit("replication_paused" if paused else "replication_resumed",
                              {"paused": paused, "epoch": self.epoch})
@@ -826,15 +1058,27 @@ class Replicator:
     def status(self) -> dict[str, Any]:
         with self._lock:
             meta = self.store.meta()
+            storage_epoch = int(meta["epoch"])
             lag_events = max(0, self.primary_tip_seq - meta["confirmed_seq"])
             lag_segments = max(0, self.primary_sealed_index - meta["confirmed_index"])
             drill = self.store.active_drill()
             open_q = self.store.list_quarantined()
+            # 连续水位：已确认分段序号必须恰好为 1..confirmed_index 无缺口
+            stored_indexes = sorted(self.store.segment_digests())
+            watermark_contiguous = stored_indexes == list(range(1, meta["confirmed_index"] + 1))
+            epoch_bounds = self.store.segment_epochs()
+            takeover_epochs = sorted({e for e in epoch_bounds.values() if e is not None})
             return {
                 "replication": {
                     "running": not self._stop.is_set(),
                     "paused": bool(meta["paused"]),
                     "epoch": self.epoch,
+                    "authoritative_epoch": storage_epoch,
+                    "ownership_lost": self._ownership_lost,
+                    "ownership_lost_at": self.ownership_lost_at,
+                    "takeover_epochs": takeover_epochs,
+                    "segment_epochs": epoch_bounds,
+                    "watermark_contiguous": watermark_contiguous,
                     "segment_size": self.segment_size,
                     "confirmed_index": meta["confirmed_index"],
                     "confirmed_seq": meta["confirmed_seq"],

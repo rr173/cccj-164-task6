@@ -368,6 +368,226 @@ class TestRestartAndFencing(ReplicaTestBase):
 
 
 # ----------------------------------------------------------------------
+# 3b) 滚动升级写入所有权围栏
+# ----------------------------------------------------------------------
+
+class TestWriteOwnershipFence(ReplicaTestBase):
+    """滚动升级期间两个实例共用同一 DB 的写入所有权缺陷回归测试。"""
+
+    def _two_instances_at_boundary(self, *, rounds=SEGMENT_SIZE * 3):
+        seed_business(self.base, rounds=rounds)
+        old = self.make_replicator()  # 旧实例 A 建站
+        self.addCleanup(self.stop, old)
+        wait_until(lambda: old.confirmed_index >= 1)
+        old.set_paused(True)  # 冻结自动轮询，手动编排竞争
+        # 接替实例 B：构造但不 start（不启动任何后台循环），手工提升纪元
+        store_b = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        new = Replicator(store_b, primary_url=self.base,
+                         max_lag_segments=500, poll_interval=0.03)
+        self.addCleanup(self.stop, new)
+        new.epoch = store_b.bump_epoch()
+        new._rebuild_from_authoritative()  # noqa: SLF001
+        store_b.audit("replicator_started", {"epoch": new.epoch})
+        return old, new
+
+    def test_60_loser_commit_rejected_and_does_not_publish_next_batch(self):
+        """旧实例提交输给接替实例：重复批次返回原结果并重建到权威水位，
+        后续新批次必须被 410 拒绝，磁盘重算值与查询结果始终一致。"""
+        old, new = self._two_instances_at_boundary()
+        k = old.confirmed_index
+        self.assertEqual(new.epoch, old.epoch + 1)
+
+        env_k1 = old._fetch_segment(k + 1)  # noqa: SLF001
+        env_k2 = old._fetch_segment(k + 2)  # noqa: SLF001
+
+        # 接替实例抢先确认中间批次 K+1
+        won = new.ingest(env_k1, source="poll")
+        self.assertEqual(won["outcome"], "confirmed")
+        self.assertEqual(won["epoch"], new.epoch)
+
+        # 旧实例的同一在途提交是重复批次：只能返回原结果，不重复落盘，
+        # 但内存必须重建到权威水位（补上 K+1）
+        dup = old.ingest(env_k1, source="poll")
+        self.assertEqual(dup["outcome"], "duplicate_ignored")
+        self.assertEqual(old.confirmed_index, k + 1)
+        self.assertEqual(len(old.segments), k + 1,
+                         "重复批次后内存必须已从权威水位重建，补上中间批次 K+1")
+
+        # 失主的后续新批次发布必须稳定退出（核心缺陷：绝不许漏 K+1 发 K+2）
+        with self.assertRaises(Exception) as cm:
+            old.ingest(env_k2, source="poll")
+        self.assertEqual(cm.exception.reason, "OWNERSHIP_LOST")
+        self.assertEqual(cm.exception.status, 410)
+
+        # 失主内存截面与磁盘重放一致，后台循环已停摆
+        disk = verifier.state_digest(verifier.replay_all(old.store.load_segments()))
+        self.assertEqual(verifier.state_digest(old.projection), disk)
+        self.assertTrue(old._ownership_lost)  # noqa: SLF001
+        self.assertTrue(old._stop.is_set())    # noqa: SLF001
+
+    def test_61_loser_quarantine_audit_and_status_visible(self):
+        """被拒的旧实例必须留下隔离记录与审计，状态页可见接管纪元。"""
+        old, new = self._two_instances_at_boundary()
+        k = old.confirmed_index
+        env_k1 = old._fetch_segment(k + 1)  # noqa: SLF001
+        env_k2 = old._fetch_segment(k + 2)  # noqa: SLF001
+        new.ingest(env_k1, source="poll")
+        # 重复批次返回原结果；随后的新批次触发失主隔离
+        self.assertEqual(old.ingest(env_k1, source="poll")["outcome"],
+                         "duplicate_ignored")
+        with self.assertRaises(Exception):
+            old.ingest(env_k2, source="poll")
+
+        # 隔离表：失主以其旧纪元身份留痕
+        qs = [q for q in old.store.list_quarantined()
+              if q["reason"] == "OWNERSHIP_LOST"]
+        self.assertTrue(qs)
+        self.assertEqual(qs[0]["epoch"], old.epoch)
+        # 审计轨迹：ownership_lost 记录带失去/当前纪元
+        events = [a for a in old.store.list_audit(200)
+                  if a["kind"] == "ownership_lost"]
+        self.assertTrue(events)
+        self.assertEqual(events[0]["detail"]["lost_epoch"], old.epoch)
+        self.assertEqual(events[0]["detail"]["current_epoch"], new.epoch)
+
+        st = old.status()["replication"]
+        self.assertTrue(st["ownership_lost"])
+        self.assertEqual(st["epoch"], old.epoch)
+        self.assertEqual(st["authoritative_epoch"], new.epoch)
+
+    def test_62_duplicate_after_takeover_rebuilds_and_returns_original(self):
+        """重复批次只能返回原结果；即便权威水位已被接替实例推进，
+        返回幂等结果前内存也必须先重建到权威水位（不漏批）。"""
+        old, new = self._two_instances_at_boundary()
+        k = old.confirmed_index
+        env_k1 = old._fetch_segment(k + 1)  # noqa: SLF001
+
+        # 接替实例以新纪元确认 K+1
+        self.assertEqual(new.ingest(env_k1, source="poll")["outcome"], "confirmed")
+
+        # 旧实例重放同批：重复批次返回原结果，且重建后内存已含 K+1
+        out = old.ingest(env_k1, source="retry-after-loss")
+        self.assertEqual(out["outcome"], "duplicate_ignored")
+        self.assertEqual(out["segment_index"], k + 1)
+        self.assertEqual(len(old.segments), k + 1)
+        disk = verifier.state_digest(verifier.replay_all(old.store.load_segments()))
+        self.assertEqual(verifier.state_digest(old.projection), disk)
+        # 同一重复批次再请求仍是原结果（稳定幂等）
+        out2 = old.ingest(env_k1, source="retry-again")
+        self.assertEqual(out2["outcome"], "duplicate_ignored")
+
+    def test_63_takeover_rebuilds_from_authoritative_watermark(self):
+        """接替实例 start()：先提升纪元取得所有权，再从存储权威水位重建，
+        随后自动续传且连续水位无缺口。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        old = self.make_replicator()
+        self.addCleanup(self.stop, old)
+        wait_until(lambda: old.confirmed_index >= 2)
+        digest_before = verifier.state_digest(old.projection)
+        boundary = old.confirmed_index
+        self.stop(old)
+
+        store_b = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        new = Replicator(store_b, primary_url=self.base,
+                         max_lag_segments=500, poll_interval=0.03)
+        # start 之前内存只是构造时重放；start 必须 bump + 重建后才开循环
+        new.start()
+        self.addCleanup(self.stop, new)
+        self.assertEqual(new.epoch, old.epoch + 1)
+        self.assertEqual(new.confirmed_index, boundary)
+        self.assertEqual(verifier.state_digest(new.projection), digest_before)
+        # 主站继续密封，新实例从权威水位续传
+        bump_capacity_n(self.base, SEGMENT_SIZE, "post-takeover")
+        wait_until(lambda: new.confirmed_index >= boundary + 1, timeout=8)
+        stored = sorted(new.store.segment_digests())
+        self.assertEqual(stored, list(range(1, new.confirmed_index + 1)),
+                         "连续水位：已确认分段序号必须恰好 1..N 无缺口")
+        self.assertTrue(new.status()["replication"]["watermark_contiguous"])
+        # 每批都标注了确认它的接管纪元
+        epochs = new.store.segment_epochs()
+        self.assertEqual(epochs[new.confirmed_index], new.epoch)
+
+    def test_64_gap_still_blocks_after_ownership_handoff(self):
+        """异常缺口（gap）不会因纪元接管被跳过：失主/新主人都必须先补齐缺口。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 3)
+        old = self.make_replicator()
+        self.addCleanup(self.stop, old)
+        wait_until(lambda: old.confirmed_index >= 1)
+        old.set_paused(True)
+        wait_until(lambda: old.status()["replication"]["primary_sealed_index"] >= 3)
+        k = old.confirmed_index
+        # 接替实例启动（不自动拉取）
+        store_b = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        new = Replicator(store_b, primary_url=self.base,
+                         max_lag_segments=500, poll_interval=0.03)
+        self.addCleanup(self.stop, new)
+        new.epoch = store_b.bump_epoch()
+        new._rebuild_from_authoritative()  # noqa: SLF001
+
+        # 直接把 K+2（跳过 K+1）投递给新主人：异常缺口必须阻挡前进
+        env_k2 = new._fetch_segment(k + 2)  # noqa: SLF001
+        with self.assertRaises(Exception) as cm:
+            new.ingest(env_k2, source="gap-push")
+        self.assertEqual(cm.exception.reason, verifier.SEGMENT_INDEX_MISMATCH)
+        self.assertEqual(new.confirmed_index, k)
+        # 缺口恢复后顺序确认，连续水位无缺口
+        env_k1 = new._fetch_segment(k + 1)  # noqa: SLF001
+        self.assertEqual(new.ingest(env_k1, source="poll")["outcome"], "confirmed")
+        self.assertEqual(new.ingest(env_k2, source="poll")["outcome"], "confirmed")
+        stored = sorted(new.store.segment_digests())
+        self.assertEqual(stored, list(range(1, new.confirmed_index + 1)))
+
+    def test_65_loser_poll_loop_halts_and_drill_ops_rejected(self):
+        """失主后台拉取循环自行停摆；演练/暂停等写操作返回 410 OWNERSHIP_LOST。"""
+        old, new = self._two_instances_at_boundary()
+        k = old.confirmed_index
+        env_k1 = old._fetch_segment(k + 1)  # noqa: SLF001
+        env_k2 = old._fetch_segment(k + 2)  # noqa: SLF001
+        new.ingest(env_k1, source="poll")
+        # 重复批次幂等返回；下一个新批次被所有权围栏拒绝并触发稳定退出
+        self.assertEqual(old.ingest(env_k1, source="poll")["outcome"],
+                         "duplicate_ignored")
+        with self.assertRaises(Exception):
+            old.ingest(env_k2, source="poll")
+        # 多等几个 poll tick，边界不会被失主推进，也无异常刷屏
+        time.sleep(0.3)
+        self.assertEqual(old.confirmed_index, k + 1)
+        with self.assertRaises(Exception) as cm:
+            old.set_paused(True)
+        self.assertEqual(cm.exception.reason, "OWNERSHIP_LOST")
+        with self.assertRaises(Exception) as cm:
+            old.create_drill("DR-DEAD", term_seconds=300)
+        self.assertEqual(cm.exception.reason, "OWNERSHIP_LOST")
+        # 只读查询仍返回权威水位截面
+        st = old.current_state()["replica"]
+        self.assertTrue(st["ownership_lost"])
+        self.assertEqual(st["confirmed_index"], k + 1)
+
+    def test_66_fenced_instance_reads_track_authoritative_watermark(self):
+        """失主停摆后，接替实例继续推进：失主的只读查询每次从存储权威水位
+        重建，磁盘重算值 == 查询结果，永不返回漏批/滞后截面。"""
+        old, new = self._two_instances_at_boundary()
+        k = old.confirmed_index
+        env_k1 = old._fetch_segment(k + 1)  # noqa: SLF001
+        env_k2 = old._fetch_segment(k + 2)  # noqa: SLF001
+        new.ingest(env_k1, source="poll")
+        with self.assertRaises(Exception):
+            old.ingest(env_k2, source="poll")  # 触发失主稳定退出
+        self.assertTrue(old._ownership_lost)  # noqa: SLF001
+
+        # 新主人继续确认 K+2（直接准入，无需网络轮询）
+        self.assertEqual(new.ingest(env_k2, source="poll")["outcome"], "confirmed")
+        self.assertEqual(new.confirmed_index, k + 2)
+
+        # 失主读路径必须追到权威水位 K+2，且与磁盘重放一致
+        st = old.current_state()["replica"]
+        self.assertEqual(st["confirmed_index"], k + 2)
+        disk = verifier.state_digest(verifier.replay_all(old.store.load_segments()))
+        self.assertEqual(st["state_digest"], disk)
+        self.assertTrue(old.status()["replication"]["watermark_contiguous"])
+
+
+# ----------------------------------------------------------------------
 # 4) 受控切换演练
 # ----------------------------------------------------------------------
 
@@ -538,9 +758,12 @@ class TestTermRecovery(ReplicaTestBase):
             rep.serve_term(token)
         self.assertEqual(cm.exception.status, 410)
         self.assertEqual(cm.exception.reason, TERM_EXPIRED)
-        # 后台同步从冻结点续上，且恰好只确认被冻结的那一段（不跳号）
+        # 后台同步从冻结点续上：被冻结的下一段必须确认（不跳号）。
+        # 建站尾部可能尚有多个已密封分段，恢复后允许连续确认多段，但水位
+        # 必须保持 1..N 连续无缺口，绝不跳过冻结点处的任何分段。
         wait_until(lambda: rep.confirmed_index >= locked + 1, timeout=6)
-        self.assertEqual(rep.confirmed_index, locked + 1)
+        self.assertGreaterEqual(rep.confirmed_index, locked + 1)
+        wait_until(lambda: rep.status()["replication"]["watermark_contiguous"])
         digests = rep.store.segment_digests()
         self.assertEqual(set(digests), set(range(1, rep.confirmed_index + 1)))
         # 只有一次终态、一条收口审计
@@ -745,7 +968,10 @@ class TestTermRecovery(ReplicaTestBase):
 
         self.set_chaos(None)
         wait_until(lambda: rep.confirmed_index >= 2, timeout=8)
-        self.assertEqual(rep.confirmed_index, 2)
+        self.assertGreaterEqual(rep.confirmed_index, 2)
+        # 缺口段 2 必须被补齐（不能跳过），恢复后整条水位 1..N 连续
+        self.assertIn(2, rep.store.segment_digests())
+        self.assertTrue(rep.status()["replication"]["watermark_contiguous"])
         resolved = [
             q for q in rep.store.list_quarantined(True)
             if q["reason"] == verifier.SEGMENT_INDEX_MISMATCH and q["resolved_at"]

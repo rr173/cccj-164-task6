@@ -44,7 +44,7 @@ open http://localhost:8899/
 bash demo_replica.sh
 ```
 
-测试：主站 220 项 + 灾备 25 项端到端（真实 HTTP 双进程 + 真实持久化）：
+测试：主站 220 项 + 灾备 32 项端到端（真实 HTTP 双进程 + 真实持久化）：
 
 ```bash
 python3 test_service.py
@@ -143,11 +143,40 @@ ISSUED（发放不透明任期 token）
   任期继续有效；验证中崩溃的演练启动时按 `PROCESS_RESTART` 作废；
 - **并发演练**：存在 VALIDATING/ISSUED 演练时再创建 → `409 ALREADY_ACTIVE_DRILL`。
 
-## 进程纪元围栏（旧任期进程迟到更新）
+## 进程纪元围栏（滚动升级写入所有权）
 
-复制器每次启动把 `meta.epoch` +1。`POST /test/ingest` 必须携带
-`X-Replica-Epoch`；纪元不匹配的迟到写入被拒绝（`410 STALE_EPOCH`）
-并写入隔离表与审计轨迹。正常轮询自动携带当前纪元。
+复制器每次启动把 `meta.epoch` +1。纪元是**存储中**的写入所有权凭证，
+每次**提交**（分段落盘 + 边界推进）都在**同一 SQLite 事务**内做条件
+CAS（`meta.epoch` 必须仍等于本实例持有的纪元、且边界恰好停在前一段），
+每次**发布**（内存投影原子替换）前再读一次权威纪元确认仍持所有权。
+`POST /test/ingest` 必须携带 `X-Replica-Epoch`；纪元不匹配的迟到写入被
+拒绝（`410 STALE_EPOCH`）并写入隔离表与审计轨迹。正常轮询自动携带当前纪元。
+
+**滚动升级竞争修复**：上一实例尚未停稳、接替实例已提升纪元时，旧实例
+在途拉到的批次可能与新实例竞争同一水位。围栏保证：
+
+- **失主提交被稳定拒绝**：旧实例即使已完成全部链校验/试折叠，提交时
+  CAS 发现纪元已变（`410 OWNERSHIP_LOST`），绝不落盘；随后停止后台
+  拉取/sweep，演练/暂停等写操作同样 410，在途工作**稳定退出**；
+- **重复批次只返回原结果**：同序号且正文一致的重复批次幂等返回
+  `duplicate_ignored`，不重复落盘；返回前若内存落后于权威水位，先从
+  存储完整重建，绝不让调用方停留在漏批截面；正文不同仍按 `BODY_CONFLICT`
+  隔离；
+- **异常缺口仍阻挡前进**：权威水位越过本序号却仍缺中段时，按
+  `SEGMENT_INDEX_MISMATCH` 隔离，必须先补齐缺口并消除旧隔离才能前进；
+- **接替实例从权威水位重建**：`start()` 顺序固定为「提升纪元 → 从存储
+  已确认分段完整重放重建内存 → 启动后台循环」，杜绝“先发布陈旧内存、
+  后接管”的窗口；
+- **可观测**：`segments` 表记录每批的确认纪元；`/ops/status` 与运维页
+  显示接管纪元（`takeover_epochs` / `segment_epochs`）、本实例纪元与
+  存储权威纪元（`epoch` / `authoritative_epoch`）、失主状态
+  （`ownership_lost`）与**连续水位**（`watermark_contiguous`：已确认
+  序号必须恰好为 `1..confirmed_index`）；失主拒绝写入
+  `ownership_lost` 审计与隔离表（含被拒旧纪元）。
+
+由此「旧实例漏掉别人刚提交的中间批次、却继续发布后续批次内存结果，
+磁盘重算值与查询结果不同」的窗口被彻底关闭：磁盘重算值始终等于查询
+截面（`replay_equivalence`）。
 
 ## HTTP API
 
@@ -201,7 +230,7 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | 表 | 内容 |
 |---|---|
 | `meta` | 确认边界（index/seq/尾摘要/尾事件哈希）、分段大小、纪元、暂停标志 |
-| `segments` | 已确认分段原文（序号主键、digest 唯一）—— 崩溃恢复的事实来源 |
+| `segments` | 已确认分段原文（序号主键、digest 唯一）及确认它的接管纪元 —— 崩溃恢复的事实来源 |
 | `quarantined` | 被拒/隔离记录、原因码、来源、检测/消除时间 |
 | `drills` | 演练状态机、任期 token/到期时间、锁定摘要、冻结截面、报告 |
 | `audit_log` | 只追加审计轨迹（启动、分段确认、隔离、演练全生命周期等） |
@@ -218,4 +247,4 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `replica/http_server.py` | 只读查询面、任期地址、运维/演练接口、测试注入口 |
 | `replica/__main__.py` | `serve` / `audit` / `audit-tail` 命令行 |
 | `replica/static/index.html` | 运维页面（进度/延迟/隔离/截面/演练/审计） |
-| `test_replica.py` | 25 项端到端测试（含到期主动收口、并发收口、重启恢复与异常批次不跳过） |
+| `test_replica.py` | 32 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过与滚动升级写入所有权围栏） |

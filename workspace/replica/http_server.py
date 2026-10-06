@@ -100,12 +100,14 @@ class ReplicaHandler(BaseHTTPRequestHandler):
                                             "message": f"已确认截面内无此命令: {cid}"})
                 return self._json(200, r)
             if path == "/api/segments":
+                epochs = rep.store.segment_epochs()
                 return self._json(200, {
                     "confirmed_index": rep.confirmed_index,
                     "segments": [
                         {"segment_index": s["segment_index"],
                          "seq_start": s["seq_start"], "seq_end": s["seq_end"],
-                         "prev_digest": s["prev_digest"], "digest": s["digest"]}
+                         "prev_digest": s["prev_digest"], "digest": s["digest"],
+                         "epoch": epochs.get(s["segment_index"])}
                         for s in rep.segments
                     ],
                 })
